@@ -37,11 +37,17 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 
 | Variable | Production | What it does |
 |---|---|---|
+| `EXL3_MAX_MB` | 128 | largest DPAS row block of the decode GEMM (MB96 / MB128 one-pass tiles for 65-128 rows; needs `-DEXL3_K5_MB128`) |
+| `EXL3_SHAPE_P_FILE` | `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` | per-shape split-K count (and NT override) table for the decode linears, keyed `"N,K,MB"`; measured on a B70 |
+| `EXL3_Q8_FOLD_MIN_M` | default (off) | int8 prefill GEMM: output Hadamard folded into the int8 weights from this many rows (setting it turns the fold on) |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
 `num_speculative_tokens_per_batch_size=[[1,4,7],[5,5,5],[6,6,4],[7,8,3],[9,256,2]]` with
 `draft_sample_method=probabilistic` (stock vLLM 0.26 fields).
+- **Split-K table** (`EXL3_SHAPE_P_FILE`): `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` is a kernel timing
+  measurement on a B70 for the model's matrix shapes (no traffic data); other GPUs or models need their own
+  timings (`{"N,K,MB": P}` or `{"N,K,MB": [NT, P]}`).
 
 ## Layout added by this fork
 
@@ -49,4 +55,5 @@ Other production settings outside this package: vLLM `gpu_memory_utilization` 0.
 |---|---|
 | `scripts/build_arc.sh` | builds the kernel libraries with the production options |
 | `csrc/` | ESIMD/SYCL kernels of `_C.so` (upstream files extended; new headers per feature) |
+| `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` | B70 split-K table for the decode linears |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |

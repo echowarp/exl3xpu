@@ -40,7 +40,7 @@ template <typename TIn>
 static void launch_had_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh, sycl::queue& q,
                           bool row_major = false) {
     int M = x.size(0), Kdim = x.size(1), S = suh.size(0), Mp = xh.size(1);
-    int n = S * M * (Kdim / 128);
+    int n = S * (row_major ? M : Mp) * (Kdim / 128);
     HadInKernel<TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), reinterpret_cast<const fp16*>(suh.data_ptr()),
                        reinterpret_cast<fp16*>(xh.data_ptr()), M, Kdim, S, (int)x.stride(0), Mp, row_major ? 1 : 0};
     int local = 8;
@@ -111,10 +111,21 @@ static void launch_dpas(const at::Tensor& xh, const at::Tensor& tr, const at::Te
 #if defined(EXL3_DPAS_LARGE_GRF) || defined(EXL3_DPAS64_LARGE_GRF)
 #ifdef EXL3_DPAS_LARGE_GRF
     constexpr bool large = true;
+#elif defined(EXL3_DPAS24_LARGE_GRF)
+    constexpr bool large = (MB >= 24);
 #elif defined(EXL3_DPAS32_LARGE_GRF)
     constexpr bool large = (MB >= 32);
 #else
-    constexpr bool large = (MB >= 40);
+    // cliff: EXL3_DPAS40_SMALLGRF / EXL3_DPAS48_SMALLGRF keep the MB=40 / 48 blocks in 128-GRF mode
+    // (twice the resident threads; the 32 -> 36 row cliff came from the switch to 256-GRF NT=2 at MB=40)
+    constexpr bool large = (MB >= 40)
+#ifdef EXL3_DPAS40_SMALLGRF
+        && MB != 40
+#endif
+#ifdef EXL3_DPAS48_SMALLGRF
+        && MB != 48
+#endif
+        ;
 #endif
     if constexpr (large) {
         // 256-register mode: room for the MB x 16 x NT accumulator without spills
@@ -128,6 +139,7 @@ static void launch_dpas(const at::Tensor& xh, const at::Tensor& tr, const at::Te
 #endif
 }
 
+static int g_cur_nt = 0;   // per-shape NT override for MB24/32 (0 = default, 1 = NT1)
 template <int K, int CB>
 static bool dispatch_dpas(int MB, const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard,
                           at::Tensor& part, int M, int Kdim, int N, int P, int rps, sycl::queue& q) {
@@ -147,20 +159,30 @@ static bool dispatch_dpas(int MB, const at::Tensor& xh, const at::Tensor& tr, co
 #ifndef EXL3_DPAS24_NT
 #define EXL3_DPAS24_NT 2
 #endif
-        case 24: launch_dpas<K, CB, 24, EXL3_DPAS24_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 24: if (g_cur_nt == 1) launch_dpas<K, CB, 24, 1>(xh, tr, shard, part, M, Kdim, N, P, rps, q); else launch_dpas<K, CB, 24, EXL3_DPAS24_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
 #endif
 #ifndef EXL3_DPAS32_NT
 #define EXL3_DPAS32_NT 2
 #endif
-        case 32: launch_dpas<K, CB, 32, EXL3_DPAS32_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 32: if (g_cur_nt == 1) launch_dpas<K, CB, 32, 1>(xh, tr, shard, part, M, Kdim, N, P, rps, q); else launch_dpas<K, CB, 32, EXL3_DPAS32_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
 #ifdef EXL3_DPAS_MB48
-        case 40: launch_dpas<K, CB, 40, 2>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
-        case 48: launch_dpas<K, CB, 48, 2>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+#ifndef EXL3_DPAS40_NT
+#define EXL3_DPAS40_NT 2
+#endif
+#ifndef EXL3_DPAS48_NT
+#define EXL3_DPAS48_NT 2
+#endif
+        case 40: launch_dpas<K, CB, 40, EXL3_DPAS40_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 48: launch_dpas<K, CB, 48, EXL3_DPAS48_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
 #endif
 #ifndef EXL3_DPAS64_NT
 #define EXL3_DPAS64_NT 1
 #endif
         case 64: launch_dpas<K, CB, 64, EXL3_DPAS64_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+#ifdef EXL3_K5_MB128
+        case 96: launch_dpas<K, CB, 96, 1>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;    // one
+        case 128: launch_dpas<K, CB, 128, 1>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;  // decode pass for 65-128 rows
+#endif
     }
     return false;
 }
@@ -168,7 +190,7 @@ static bool dispatch_dpas(int MB, const at::Tensor& xh, const at::Tensor& tr, co
 #ifndef EXL3_DPAS24_NT
 #define EXL3_DPAS24_NT 2
 #endif
-static int dpas_nt(int MB) { return MB == 4 ? EXL3_DPAS4_NT : MB == 8 ? EXL3_DPAS8_NT : MB == 24 ? EXL3_DPAS24_NT : (MB == 40 || MB == 48) ? 2 : (MB <= 16 ? 4 : (MB == 32 ? EXL3_DPAS32_NT : EXL3_DPAS64_NT)); }
+static int dpas_nt(int MB) { return MB >= 96 ? 1 : MB == 4 ? EXL3_DPAS4_NT : MB == 8 ? EXL3_DPAS8_NT : MB == 24 ? EXL3_DPAS24_NT : MB == 40 ? EXL3_DPAS40_NT : MB == 48 ? EXL3_DPAS48_NT : (MB <= 16 ? 4 : (MB == 32 ? EXL3_DPAS32_NT : EXL3_DPAS64_NT)); }
 static int g_vec_max_m = 2;   // vector kernel for M<=2, DPAS (flat cost up to M=8) above
 
 // Split-K sizing: threads to aim for when choosing the number of K splits. Measured on B70 (all linears,
@@ -177,10 +199,11 @@ static int g_vec_max_m = 2;   // vector kernel for M<=2, DPAS (flat cost up to M
 static int g_target_threads = 1024;          // vector GEMV (M<=2) and DPAS MB=32
 static int g_target_threads_mb16 = 1408;     // DPAS MB=8/16: plateau 1280-1536 (M=4 35.1->32.2 ms, M=16 38.7->36.0), cliff at 1664
 static int g_target_threads_mb64 = 2048;
+static int g_wave_cap = 0;                  // 0 = off; else choose P = floor(cap / units) (see exl3_gemm_small)
 
 // Column-strip width (tiles per thread) per case, from bench sweeps on B70:
 // K=4 M=1 -> 8 (longer contiguous reads), K=4 M=2..4 -> 4, K=6 -> 4 (two 32-lane tile pairs), M=8 -> 2.
-constexpr int nt_of(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
+constexpr int nt_of(int K, int MR) { return MR == 8 ? ((K & 1) ? 4 : 2) : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
 static int nt_for(int K, int MR) { return nt_of(K, MR); }
 
 template <int K, int CB>
@@ -249,8 +272,53 @@ static bool fused_small(const at::Tensor& x, const at::Tensor& tr, const at::Ten
     return true;
 }
 
+// Input-Hadamard-only fusion: the DPAS kernel computes xh for its own 128-row blocks (no HadIn launch);
+// split-K partials still go through HadOutKernel, split sizing as the unfused MB=8 path (target mb16).
+static bool g_fused_in = false;
+void exl3_set_fused_in(int64_t on) { g_fused_in = on != 0; }
+template <int K, int CB>
+static void fused_in_small(const at::Tensor& x, const at::Tensor& tr, const at::Tensor& suh, const at::Tensor& svh,
+                           const at::Tensor& shard, at::Tensor& out, int M, int Kdim, int N, sycl::queue& q);
+
 static bool g_fused = false;   // measured slower under XPU graphs (serialized split-K tail); opt in via exl3_set_fused
 void exl3_set_fused(int64_t on) { g_fused = on != 0; }
+
+template <int K, int CB>
+static void fused_in_small(const at::Tensor& x, const at::Tensor& tr, const at::Tensor& suh, const at::Tensor& svh,
+                           const at::Tensor& shard, at::Tensor& out, int M, int Kdim, int N, sycl::queue& q) {
+    int tk = Kdim / 16, tiles_n = N / 16;
+    constexpr int NT = EXL3_DPAS8_NT;
+    int n_strips = tiles_n / NT;
+    int P = std::max(1, std::min(tk / 8, (g_target_threads_mb16 + n_strips - 1) / n_strips));
+    int rps = ((tk + P - 1) / P + 7) / 8 * 8;             // whole 128-row Hadamard blocks per split
+    P = (tk + rps - 1) / rps;
+    auto part = at::empty({P, M, N}, x.options().dtype(at::kFloat));
+    FusedArgs fa{reinterpret_cast<const fp16*>(x.data_ptr()), (int)x.stride(0),
+                 reinterpret_cast<const fp16*>(suh.data_ptr()), nullptr, nullptr, 0, nullptr};
+    DpasKernel<K, CB, 8, NT, true, true> k{nullptr, reinterpret_cast<const uint32_t*>(tr.data_ptr()), shard.data_ptr<int>(),
+                                           part.data_ptr<float>(), M, Kdim, N, tiles_n, rps, n_strips, 1, 8, fa, P};
+    launch_fused(k, n_strips * P, q);
+    if (out.scalar_type() == at::kHalf) launch_had_out<fp16>(part, P, svh, out, q);
+    else if (out.scalar_type() == at::kBFloat16) launch_had_out<sycl::ext::oneapi::bfloat16>(part, P, svh, out, q);
+    else launch_had_out<float>(part, P, svh, out, q);
+}
+
+#include <unordered_map>
+static std::unordered_map<int64_t, int> g_shape_p;   // (N, Kdim, MB or -MR) -> split-K count P
+static int64_t shape_key(int64_t N, int64_t Kdim, int64_t mb) { return (N << 32) ^ (Kdim << 8) ^ (mb & 0xFF); }
+void exl3_set_shape_p(int64_t N, int64_t Kdim, int64_t mb, int64_t P) {
+    if (P <= 0) g_shape_p.erase(shape_key(N, Kdim, mb)); else g_shape_p[shape_key(N, Kdim, mb)] = (int)P; }
+void exl3_clear_shape_p() { g_shape_p.clear(); }
+static std::unordered_map<int64_t, int> g_shape_nt;  // (N, Kdim, MB) -> NT override (1) for MB24/32
+void exl3_set_shape_nt(int64_t N, int64_t Kdim, int64_t mb, int64_t nt) {
+    if (nt <= 0) g_shape_nt.erase(shape_key(N, Kdim, mb)); else g_shape_nt[shape_key(N, Kdim, mb)] = (int)nt; }
+static int g_stage_mask = 7;   // probe: bit0 HadIn, bit1 GEMM, bit2 HadOut (timing only; 7 = normal)
+void exl3_set_stage_mask(int64_t m) { g_stage_mask = (int)m; }
+struct NoopKernel { float* p; void operator()(sycl::nd_item<1> it) const { if (it.get_global_id(0) == (size_t)-1) p[0] = 0; } };
+void exl3_noop(at::Tensor t, int64_t n, int64_t items) {
+    auto& q = queue_of(t); float* p = t.data_ptr<float>();
+    for (int64_t i = 0; i < n; ++i) q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(items, 16), NoopKernel{p}); });
+}
 
 void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
                      at::Tensor out, int64_t K, int64_t cb) {
@@ -265,12 +333,20 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
         else if (K == 6 && cb == 2) done = fused_small<6, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
         if (done) return;
     }
+    if (g_fused_in && M > g_vec_max_m && M <= 8 && x.scalar_type() == at::kHalf) {
+        if (K == 4 && cb == 2) { fused_in_small<4, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q); return; }
+        if (K == 6 && cb == 2) { fused_in_small<6, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q); return; }
+    }
     bool use_vec = M <= g_vec_max_m;
     int MR = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
 #ifdef EXL3_DPAS_MB4
     int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
 #elif defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
+#ifdef EXL3_K5_MB128
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : (M <= 64 ? 64 : (M <= 96 ? 96 : 128)))))));
+#else
     int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
+#endif
 #elif defined(EXL3_DPAS_MB24)
     int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : 64)));
 #else
@@ -280,18 +356,30 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
     int m_blocks = use_vec ? 1 : (M + MB - 1) / MB;
     int Mp = use_vec ? M : m_blocks * MB;
     // blocked activations [S][Mp][Kdim] (row-blocked inside); pad rows must be zero for DPAS
-    auto xh = Mp == M ? at::empty({S, Mp, Kdim}, x.options().dtype(at::kHalf))
-                      : at::zeros({S, Mp, Kdim}, x.options().dtype(at::kHalf));
-    if (x.scalar_type() == at::kHalf) launch_had_in<fp16>(x, suh, xh, q);
+    auto xh = at::empty({S, Mp, Kdim}, x.options().dtype(at::kHalf));   // pad rows zeroed by HadInKernel
+    if (!(g_stage_mask & 1)) ;
+    else if (x.scalar_type() == at::kHalf) launch_had_in<fp16>(x, suh, xh, q);
     else if (x.scalar_type() == at::kBFloat16) launch_had_in<sycl::ext::oneapi::bfloat16>(x, suh, xh, q);
     else TORCH_CHECK(false, "x dtype");
 
     int tk = Kdim / 16;
-    int n_strips = (N / 16) / (use_vec ? nt_for(K, MR) : dpas_nt(MB));
+    g_cur_nt = 0;
+    if (!use_vec && (MB == 24 || MB == 32)) {
+        auto it = g_shape_nt.find(shape_key(N, Kdim, MB));
+        if (it != g_shape_nt.end()) g_cur_nt = it->second;
+    }
+    int n_strips = (N / 16) / (use_vec ? nt_for(K, MR) : (g_cur_nt == 1 ? 1 : dpas_nt(MB)));
     int units = n_strips * m_blocks;
     int target = use_vec ? g_target_threads
                : (MB <= 16 ? g_target_threads_mb16 : (MB >= 40 ? g_target_threads_mb64 : g_target_threads));
     int P = std::max(1, std::min(tk, (target + units - 1) / units));
+    // wave cap: the largest split count whose threads still fit one resident wave (B70: 2048 = 32 Xe x 8 XVE x 8
+    // threads at 128 GRF). Rounding the target up past the cap leaves a partial second wave (gate_up 504 -> 342 GB/s).
+    if (g_wave_cap > 0 && (use_vec || MB <= 16)) P = std::max(1, std::min(tk, g_wave_cap / units));
+    {   // per-shape split-K count (tuned table; wave quantization differs per shape)
+        auto it = g_shape_p.find(shape_key(N, Kdim, use_vec ? -MR : MB));
+        if (it != g_shape_p.end()) P = std::max(1, std::min(tk, it->second));
+    }
     int rps = (tk + P - 1) / P;
     P = (tk + rps - 1) / rps;
     auto part = at::empty({P, M, N}, x.options().dtype(at::kFloat));
@@ -300,6 +388,7 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
 #ifdef EXL3_DEBUG_SKIP_GEMV
     ok = true; K = -1;
 #endif
+    if (!(g_stage_mask & 2)) { ok = true; K = -1; }
 #define EXL3_CASE(KK, CC) \
     if (K == KK && cb == CC) ok = use_vec ? dispatch_mr<KK, CC>(MR, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q) \
                                           : dispatch_dpas<KK, CC>(MB, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
@@ -311,6 +400,7 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
 #undef EXL3_CASE
     TORCH_CHECK(ok, "exl3_gemm_small: unsupported K/codebook ", K, "/", cb);
 
+    if (!(g_stage_mask & 4)) return;
     if (out.scalar_type() == at::kHalf) launch_had_out<fp16>(part, P, svh, out, q);
     else if (out.scalar_type() == at::kBFloat16) launch_had_out<sycl::ext::oneapi::bfloat16>(part, P, svh, out, q);
     else if (out.scalar_type() == at::kFloat) launch_had_out<float>(part, P, svh, out, q);
@@ -347,22 +437,22 @@ static Ctx& ctx(sycl::queue& q) {
     return it->second;
 }
 static void gemm(sycl::queue& q, const at::Tensor& like, const int8_t* xq, const int8_t* wq, const float* sw_dev, const float* sx, fp16* y,
-                   int64_t M, int64_t K, int64_t N, int64_t ldy) {
+                   int64_t M, int64_t K, int64_t N, int64_t ldy, bool per_n = false) {
     using namespace dnnl;
     using dt = memory::data_type;
     auto& c = ctx(q);
     // scratchpad in user mode, allocated through torch (library-mode scratch lives outside vLLM's memory budget)
-    static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, std::pair<dnnl::matmul, size_t>> cache;
-    auto key = std::make_tuple(M, K, N, ldy);
+    static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, std::pair<dnnl::matmul, size_t>> cache;
+    auto key = std::make_tuple(M, K, N, ldy, per_n);
     memory::desc a_md({M, K}, dt::s8, memory::dims{K, 1});
     memory::desc b_md({K, N}, dt::s8, memory::dims{N, 1});
     memory::desc c_md({M, N}, dt::f16, memory::dims{ldy, 1});
     memory::desc sx_md({M, 1}, dt::f32, memory::dims{1, 1});
-    memory::desc sw_md({1}, dt::f32, memory::dims{1});
+    memory::desc sw_md({per_n ? N : 1}, dt::f32, memory::dims{1});   // per_n: per-output-column weight scales
     auto it = cache.find(key);
     if (it == cache.end()) {
         primitive_attr attr;
-        attr.set_scales_mask(DNNL_ARG_WEIGHTS, 0);
+        attr.set_scales_mask(DNNL_ARG_WEIGHTS, per_n ? (1 << 1) : 0);
         post_ops po;
         po.append_binary(algorithm::binary_mul, sx_md);
         attr.set_post_ops(po);
@@ -533,6 +623,53 @@ static void launch_reconstruct_q8(const at::Tensor& tr, at::Tensor& w, int n0, s
     q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
 }
 
+// output Hadamard folded into the int8 weights. Per layer, once: W' = H128_N(W_inner)/sqrt(128),
+// per-output-column int8 scales amax_n/127 (fixed-scale folding clips, per-column keeps today's error); the GEMM's per-column
+// weight scale amax_n/127 * svh[n] then yields the final output directly (no had_out pass). Toggle exl3_set_q8_fold.
+static bool g_q8_fold = false;   // off: +0.3% end to end only (A/B); exl3_set_q8_fold(1) or EXL3_Q8_FOLD_MIN_M to test
+// the fold moves the transform onto the weights (per chunk): pays off only at large M; env EXL3_Q8_FOLD_MIN_M overrides
+static int64_t g_q8_fold_min_m = std::getenv("EXL3_Q8_FOLD_MIN_M") ? std::atoll(std::getenv("EXL3_Q8_FOLD_MIN_M")) : 2048;
+static bool g_q8_fold_env = std::getenv("EXL3_Q8_FOLD_MIN_M") && (g_q8_fold = true);   // env set -> fold on
+void exl3_set_q8_fold(int64_t on) { g_q8_fold = on != 0; if (on > 1) g_q8_fold_min_m = on; }
+template <int K>
+static void launch_reconstruct_q8_fold(const at::Tensor& tr, at::Tensor& w, int n0, const float* qinv, sycl::queue& q) {
+    int tk = tr.size(0), tiles_n = tr.size(1), n_out = w.size(1);
+    constexpr int NT = 8;
+    int n_strips = n_out / (16 * NT);
+    ReconstructKernel<K, 2, NT, int8_t, true> k{reinterpret_cast<const uint32_t*>(tr.data_ptr()),
+                                                reinterpret_cast<int8_t*>(w.data_ptr()), tiles_n, n0 / 16, n_out, n_strips, tk,
+                                                0.0f, qinv};
+    int n = n_strips * tk, local = 8;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+}
+template <int K, int CB> static void launch_reconstruct(const at::Tensor& tr, at::Tensor& w, int n0, sycl::queue& q);
+// (qinv [n] = 127/amax_n, deq [n] = amax_n/127 * svh[n]), cached per trellis tensor
+static std::pair<at::Tensor, at::Tensor>& fold_scales(const at::Tensor& tr, const at::Tensor& svh, int64_t K, sycl::queue& q) {
+    static std::map<const void*, std::pair<at::Tensor, at::Tensor>> cache;
+    auto it = cache.find(tr.data_ptr());
+    if (it != cache.end()) return it->second;
+    const int64_t k = tr.size(0) * 16, n = tr.size(1) * 16;
+    static std::vector<at::Tensor> hmat(16);
+    auto& H = hmat.at(tr.device().index());
+    if (!H.defined()) {
+        auto h = at::ones({1, 1}, tr.options().dtype(at::kFloat));
+        while (h.size(0) < 128) h = at::cat({at::cat({h, h}, 1), at::cat({h, -h}, 1)}, 0);
+        H = h / std::sqrt(128.0f);
+    }
+    auto amax = at::empty({n}, tr.options().dtype(at::kFloat));
+    const int64_t SL = 2048;   // column slices bound the one-time fp16/fp32 temporaries
+    for (int64_t c0 = 0; c0 < n; c0 += SL) {
+        int64_t c1 = std::min(c0 + SL, n);
+        auto w = at::empty({k, c1 - c0}, tr.options().dtype(at::kHalf));
+        if (K == 4) launch_reconstruct<4, 2>(tr, w, (int)c0, q); else launch_reconstruct<6, 2>(tr, w, (int)c0, q);
+        auto wf = at::matmul(w.to(at::kFloat).view({k, (c1 - c0) / 128, 128}), H).view({k, c1 - c0});
+        amax.narrow(0, c0, c1 - c0).copy_(std::get<0>(wf.abs().max(0)).clamp_min(1e-8f));
+    }
+    auto qinv = (127.0f / amax).contiguous();
+    auto deq = (amax / 127.0f * svh.to(at::kFloat)).contiguous();
+    return cache.emplace(tr.data_ptr(), std::make_pair(qinv, deq)).first->second;
+}
+
 void exl3_reconstruct(at::Tensor trellis, at::Tensor w, int64_t n0, int64_t K, int64_t cb) {
     TORCH_CHECK(w.scalar_type() == at::kHalf && w.is_contiguous() && w.size(1) % 128 == 0 && n0 % 128 == 0);
     TORCH_CHECK(w.size(0) == trellis.size(0) * 16 && n0 + w.size(1) <= trellis.size(1) * 16);
@@ -626,6 +763,37 @@ void exl3_fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::T
     qq.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, G), props, kern); });
 }
 
+// ---- diagnostic: stream the trellis with exactly the MB=8 DPAS thread mapping (strip of NT tiles x K split),
+// no decode, no DPAS: an xor-reduce per thread. Tells whether the access pattern + static split partition can
+// reach the DRAM ceiling on their own.
+struct StreamProbe {
+    const uint32_t* tr; uint32_t* out; int tiles_n, rps, n_strips, tk, W, NT;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int id = it.get_global_id(0);
+        int strip = id % n_strips, p = id / n_strips;
+        int r0 = p * rps, r1 = r0 + rps; if (r1 > tk) r1 = tk;
+        simd<uint32_t, 128> acc = 0;
+        for (int r = r0; r < r1; ++r) acc ^= block_load<uint32_t, 128>(tr + ((size_t)r * tiles_n + strip * 4) * 32);
+        simd<uint32_t, 16> o = acc.template select<16, 1>(0);
+#pragma unroll
+        for (int i = 1; i < 8; ++i) o ^= acc.template select<16, 1>(16 * i);
+        block_store<uint32_t, 16>(out + (size_t)id * 16, o);
+    }
+};
+void exl3_stream_probe(at::Tensor trellis, at::Tensor out, int64_t M) {
+    TORCH_CHECK(trellis.size(2) == 64, "K=4 trellis only");   // 8K = 32 words = 64 shorts per tile
+    int tk = trellis.size(0), tiles_n = trellis.size(1);
+    int n_strips = tiles_n / 4;
+    int P = std::max(1, std::min(tk, (g_target_threads_mb16 + n_strips - 1) / n_strips));
+    int rps = (tk + P - 1) / P; P = (tk + rps - 1) / rps;
+    TORCH_CHECK(out.numel() >= (int64_t)n_strips * P * 16);
+    auto& q = queue_of(trellis);
+    StreamProbe k{reinterpret_cast<const uint32_t*>(trellis.data_ptr()), reinterpret_cast<uint32_t*>(out.data_ptr()),
+                  tiles_n, rps, n_strips, tk, 32, 4};
+    int n = n_strips * P;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), k); });
+}
+
 bool exl3_supported(int64_t K, int64_t cb);
 
 // ------------------------------------------------------------------------------------------------
@@ -701,6 +869,20 @@ at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Ten
             static std::vector<at::Tensor> swd(16);
             auto& swt = swd.at(x.device().index());
             if (!swt.defined()) swt = at::full({1}, sw, x.options().dtype(at::kFloat));
+            if (g_q8_fold && M >= g_q8_fold_min_m && x2.scalar_type() == at::kHalf) {
+                auto& fs = fold_scales(trellis, svh, K, q);
+                auto yf = at::empty({Ms, n}, x.options().dtype(at::kHalf));
+                for (size_t g = 0; g + 1 < group_bounds.size(); ++g) {
+                    int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1], ng = g1 - g0;
+                    auto w = at::empty({k, ng}, x.options().dtype(at::kChar));
+                    if (K == 4) launch_reconstruct_q8_fold<4>(trellis, w, g0, fs.first.data_ptr<float>(), q);
+                    else launch_reconstruct_q8_fold<6>(trellis, w, g0, fs.first.data_ptr<float>(), q);
+                    q8dnnl::gemm(q, x, reinterpret_cast<const int8_t*>(xq.data_ptr()) + g * Ms * k,
+                                 reinterpret_cast<const int8_t*>(w.data_ptr()), fs.second.data_ptr<float>() + g0,
+                                 sx.data_ptr<float>() + g * Ms, reinterpret_cast<fp16*>(yf.data_ptr()) + g0, Ms, k, ng, n, true);
+                }
+                return yf.narrow(0, 0, M).view(shape);
+            }
             auto y = at::empty({Ms, n}, x.options().dtype(at::kHalf));
             for (size_t g = 0; g + 1 < group_bounds.size(); ++g) {
                 int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1], ng = g1 - g0;
@@ -770,9 +952,13 @@ void exl3_set_target_threads(int64_t n) { g_target_threads = (int)n; }
 void exl3_set_target_threads_mb64(int64_t n) { g_target_threads_mb64 = (int)n; }
 void exl3_set_target_threads_mb16(int64_t n) { g_target_threads_mb16 = (int)n; }
 void exl3_set_vec_max_m(int64_t n) { g_vec_max_m = (int)n; }
+void exl3_set_wave_cap(int64_t n) { g_wave_cap = (int)n; }
 
 TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_int8(int on) -> ()", &exl3_set_int8);
+#ifdef EXL3_DNNL
+    m.def("exl3_set_q8_fold(int on) -> ()", &exl3_set_q8_fold);
+#endif
 #ifdef EXL3_DNNL
     m.def("exl3_sdpa(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
     m.impl("exl3_sdpa", torch::kXPU, &exl3_sdpa);
@@ -781,6 +967,12 @@ TORCH_LIBRARY(exl3xpu_C, m) {
 #endif
     m.def("linear(Tensor x, Tensor trellis, Tensor suh, Tensor svh, Tensor shard_of_nb, int[] group_bounds, int K, int cb, int small_m_max, int slice_n) -> Tensor");
     m.impl("linear", torch::kXPU, &exl3_linear);
+    m.def("exl3_set_stage_mask(int m) -> ()", &exl3_set_stage_mask);
+    m.def("exl3_set_shape_p(int N, int Kdim, int mb, int P) -> ()", &exl3_set_shape_p);
+    m.def("exl3_clear_shape_p() -> ()", &exl3_clear_shape_p);
+    m.def("exl3_set_shape_nt(int N, int Kdim, int mb, int nt) -> ()", &exl3_set_shape_nt);
+    m.def("exl3_noop(Tensor t, int n, int items) -> ()");
+    m.impl("exl3_noop", torch::kXPU, &exl3_noop);
     m.def("exl3_gemm_small(Tensor x, Tensor trellis, Tensor suh, Tensor svh, Tensor shard_of_nb, Tensor(a!) out, int K, int cb) -> ()");
     m.impl("exl3_gemm_small", torch::kXPU, &exl3_gemm_small);
     m.def("exl3_supported(int K, int cb) -> bool", &exl3_supported);
@@ -796,7 +988,11 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_target_threads_mb64(int n) -> ()", &exl3_set_target_threads_mb64);
     m.def("exl3_set_target_threads_mb16(int n) -> ()", &exl3_set_target_threads_mb16);
     m.def("exl3_set_vec_max_m(int n) -> ()", &exl3_set_vec_max_m);
+    m.def("exl3_set_wave_cap(int n) -> ()", &exl3_set_wave_cap);
     m.def("exl3_set_fused(int on) -> ()", &exl3_set_fused);
+    m.def("exl3_set_fused_in(int on) -> ()", &exl3_set_fused_in);
+    m.def("exl3_stream_probe(Tensor trellis, Tensor(a!) out, int M) -> ()");
+    m.impl("exl3_stream_probe", torch::kXPU, &exl3_stream_probe);
     m.def("exl3_set_local(int n) -> ()", &exl3_set_local);
     m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
     m.def("exl3_fa_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");

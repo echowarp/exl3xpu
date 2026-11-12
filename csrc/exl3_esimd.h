@@ -13,6 +13,7 @@
 // u only and the base column t>>5 depends on grp only, so accumulators are acc[h][grp] and the
 // final reduction sums groups of 32/V adjacent lanes.
 
+#include <type_traits>
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
@@ -291,9 +292,18 @@ struct HadInKernel {
         int id = it.get_global_id(0);
         int kb_n = Kdim / 128;
         int kb = id % kb_n;
-        int m = (id / kb_n) % M;
-        int g = id / (kb_n * M);
+        int rows = row_major ? M : Mp;          // blocked: also write the zero pad rows (no separate fill kernel)
+        int m = (id / kb_n) % rows;
+        int g = id / (kb_n * rows);
         if (g >= S) return;
+        if (m >= M) {
+            int kt = Kdim / 16;
+            simd<fp16, 16> z = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                block_store<fp16, 16>(xh + (((size_t)g * kt + kb * 8 + i) * Mp + m) * 16, z);
+            return;
+        }
         simd<TIn, 128> xi = block_load<TIn, 128>(x + (size_t)m * x_stride + kb * 128);
         simd<fp16, 128> su = block_load<fp16, 128>(suh + (size_t)g * Kdim + kb * 128);
         simd<float, 128> v = convert<float>(xi) * convert<float>(su);
@@ -328,10 +338,31 @@ struct HadOutKernel {
         int m = id / nb_n;
         if (m >= M) return;
         simd<float, 128> v = 0.0f;
+#ifdef EXL3_HADOUT_B
+        // loads issued EXL3_HADOUT_B at a time (independent registers), then added
+        // in the same p order: bit-exact
+        constexpr int HB = EXL3_HADOUT_B;
+        {
+#pragma clang fp reassociate(off)
+        int p = 0;
+        for (; p + HB <= P; p += HB) {
+            simd<TPart, 128> t[HB];
+#pragma unroll
+            for (int b = 0; b < HB; ++b) t[b] = block_load<TPart, 128>(part + ((size_t)(p + b) * M + m) * N + nb * 128);
+#pragma unroll
+            for (int b = 0; b < HB; ++b) v += convert<float>(t[b]);
+        }
+        for (; p < P; ++p)
+            v += convert<float>(block_load<TPart, 128>(part + ((size_t)p * M + m) * N + nb * 128));
+        }
+        fwht128(v);
+        simd<fp16, 128> sv = block_load<fp16, 128>(svh + nb * 128);
+#else
         for (int p = 0; p < P; ++p)
             v += convert<float>(block_load<TPart, 128>(part + ((size_t)p * M + m) * N + nb * 128));
         fwht128(v);
         simd<fp16, 128> sv = block_load<fp16, 128>(svh + nb * 128);
+#endif
         v = v * kRsqrt128 * convert<float>(sv);
         block_store<TOut, 128>(out + (size_t)m * out_stride + nb * 128, convert<TOut>(v));
     }
@@ -589,8 +620,8 @@ struct GemvKernel {
 // Reading the trellis words in (b-major, a-minor) lane order (a transpose folded into the word
 // read) lets each b-row be written with one strided region move.
 
-template <int K, int CB, int MB, int NT, bool FUSED = false>
-struct DpasKernel {
+template <int K, int CB, int MB, int NT, bool FUSED = false, bool FIN_ONLY = false>
+struct DpasKernel {   // FUSED: input Hadamard in-kernel; FIN_ONLY: ... but split-K partials reduced by HadOutKernel
     const fp16* xh;          // [S, M, Kdim]
     const uint32_t* tr;      // [Kdim/16, N/16, 8K]
     const int* shard_of_nb;  // [N/128]
@@ -615,7 +646,11 @@ struct DpasKernel {
     static constexpr bool FOLD = false;
 #else
     // codebook affine folded out of the decode loop where decode is the bottleneck (small row blocks)
-    static constexpr bool FOLD = (CB == 2) && (MB <= 8) && !FUSED;   // MB=16: extra accumulator spills (35 -> 70 ms)
+#ifdef EXL3_K5_FOLD24
+    static constexpr bool FOLD = (CB == 2) && (MB == 24) && !FUSED;   // decode-bound MB24 tile only
+#else
+    static constexpr bool FOLD = (CB == 2) && (MB <= 8) && !FUSED;
+#endif   // MB=16: extra accumulator spills (35 -> 70 ms)
 #endif
     template <int N>
     static ESIMD_INLINE simd<fp16, N> dec(simd<uint32_t, N> st) {
@@ -731,7 +766,14 @@ struct DpasKernel {
         int m0 = mb * MB;
         int mrows = M - m0; if (mrows > MB) mrows = MB;
 
-        simd<float, MB * 16 * NT> acc = 0.0f;   // [NT][MB][16]
+#ifdef EXL3_DPAS_HACC
+        // fp16 DPAS accumulation from MB >= EXL3_DPAS_HACC (halves the accumulator registers so the
+        // 17-32-row blocks can run NT=4 at 128 GRF; upstream exllamav3 EXL3_GEMM_H_ACC analogue)
+        using AccT = std::conditional_t<(!FUSED && !FOLD && MB >= EXL3_DPAS_HACC), fp16, float>;
+#else
+        using AccT = float;
+#endif
+        simd<AccT, MB * 16 * NT> acc = AccT(0.0f);   // [NT][MB][16]
         simd<float, FOLD ? MB * 16 : 16> accs = 0.0f;   // FOLD: activation row sums (all 16 columns equal)
         if constexpr (FUSED) {
             static_assert(MB == 8, "fused DPAS path is for one 8-row block");
@@ -772,6 +814,9 @@ struct DpasKernel {
             size_t t0 = (size_t)r0 * tiles_n + tile_n0;
             load_words<NT, W>(tr + t0 * W, t0 == 0, nwords, nprevs);
         }
+#endif
+#ifdef EXL3_K5_UNROLL24
+#pragma unroll (MB == 24 ? EXL3_K5_UNROLL24 : 1)
 #endif
         for (int r = r0; r < r1; ++r) {
             size_t t0 = (size_t)r * tiles_n + tile_n0;
@@ -826,8 +871,8 @@ struct DpasKernel {
 #pragma unroll
                 for (int rb = 0; rb < MB / RC; ++rb) {
                     auto c = acc.template select<RC * 16, 1>((j * MB + rb * RC) * 16);
-                    c = xmx::dpas<8, RC, float, float, fp16, fp16>(
-                        simd<float, RC * 16>(c), simd<fp16, 256>(Bv), simd<fp16, RC * 16>(Am.template select<RC * 16, 1>(rb * RC * 16)));
+                    c = xmx::dpas<8, RC, AccT, AccT, fp16, fp16>(
+                        simd<AccT, RC * 16>(c), simd<fp16, 256>(Bv), simd<fp16, RC * 16>(Am.template select<RC * 16, 1>(rb * RC * 16)));
                 }
             }
             if constexpr (FOLD) {
@@ -854,10 +899,10 @@ struct DpasKernel {
                         block_store<float, 16>(part + ((size_t)p * M + m0 + m) * N + (tile_n0 + j) * 16, o);
                     } else {
                         block_store<float, 16>(part + ((size_t)p * M + m0 + m) * N + (tile_n0 + j) * 16,
-                                               acc.template select<16, 1>((j * MB + m) * 16));
+                                               simd<float, 16>(acc.template select<16, 1>((j * MB + m) * 16)));
                     }
                 }
-        if constexpr (FUSED) fused_had_out(fa, part, M, N, Psplit, tile_n0 * 16, NT * 16);
+        if constexpr (FUSED && !FIN_ONLY) fused_had_out(fa, part, M, N, Psplit, tile_n0 * 16, NT * 16);
     }
 };
 
@@ -866,11 +911,14 @@ struct DpasKernel {
 // Reconstruct W_inner (Hadamard domain) as fp16 [Kdim, n_out], columns [n0, n0 + n_out) of the
 // packed tensor. Thread = (tile-row, strip of NT tiles). Bit-exact.
 
-template <int K, int CB, int NT, typename TW = fp16>
+template <int K, int CB, int NT, typename TW = fp16, bool FOLD = false>
 struct ReconstructKernel {
     const uint32_t* tr; TW* w;
     int tiles_n, tile_n0, n_out, n_strips, tk;
     float q8_inv = 0.0f;   // TW = int8_t: w = rne(W_inner * q8_inv)
+    // FOLD (TW = int8_t, NT = 8): fold the output Hadamard into the weights:
+    // w = rne(H128(W_inner row strip) / sqrt(128) * qinv[col]), per-output-column inverse scales (absolute columns)
+    const float* qinv = nullptr;
     static constexpr int G = Geo<K>::G, V = Geo<K>::V, D = Geo<K>::D, W = Geo<K>::WORDS;
     static constexpr int P = V == 8 ? 4 : (V == 16 ? 2 : 1);
     static constexpr int STR = V == 8 ? 2 : (V == 16 ? 4 : 1);
@@ -922,11 +970,19 @@ struct ReconstructKernel {
             build<0>(dw, dwprev, T);
             Om.template select<16, 1, 16, 1>(0, 16 * j) = T.template bit_cast_view<fp16, 16, 16>();
         }
+        simd<float, (FOLD ? 128 : 1)> qi;
+        if constexpr (FOLD) qi = block_load<float, 128>(qinv + (size_t)(tile_n0 + strip * NT) * 16) * kRsqrt128;
 #pragma unroll
         for (int rr = 0; rr < 16; ++rr)
         {
             simd<fp16, 16 * NT> row = out.template select<16 * NT, 1>(rr * 16 * NT);
-            if constexpr (std::is_same_v<TW, fp16>)
+            if constexpr (FOLD) {
+                static_assert(NT == 8 && std::is_same_v<TW, int8_t>, "fold needs 128-column strips and int8 output");
+                simd<float, 128> v = convert<float>(row);
+                fwht128(v);
+                block_store<int8_t, 128>(w + ((size_t)r * 16 + rr) * n_out + strip * NT * 16,
+                                         convert<int8_t>(rnde<float>(v * qi)));
+            } else if constexpr (std::is_same_v<TW, fp16>)
                 block_store<fp16, 16 * NT>(w + ((size_t)r * 16 + rr) * n_out + strip * NT * 16, row);
             else
                 block_store<TW, 16 * NT>(w + ((size_t)r * 16 + rr) * n_out + strip * NT * 16,

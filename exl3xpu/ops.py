@@ -27,6 +27,17 @@ def _get_esimd():
         try:
             torch.ops.load_library(os.environ.get("EXL3_LIB") or os.path.join(os.path.dirname(__file__), "_C.so"))
             _esimd = torch.ops.exl3xpu_C
+            if os.environ.get("EXL3_MAX_MB") and hasattr(_esimd, "exl3_set_max_mb"):   # MB96/128 tiles
+                _esimd.exl3_set_max_mb(int(os.environ["EXL3_MAX_MB"]))
+            # per-shape split-K table (measured per GPU, e.g. models/<id>/shape_p_c.json) for the decode linears
+            if os.environ.get("EXL3_SHAPE_P_FILE") and hasattr(_esimd, "exl3_set_shape_p"):
+                import json as _json
+                for _key, _P in _json.load(open(os.environ["EXL3_SHAPE_P_FILE"])).items():
+                    _n, _k, _mb = map(int, _key.split(","))
+                    if isinstance(_P, list):
+                        _esimd.exl3_set_shape_nt(_n, _k, _mb, int(_P[0])); _P = _P[1]
+                    _esimd.exl3_set_shape_p(_n, _k, _mb, int(_P))
+                print(f"exl3xpu: shape_p table {os.environ['EXL3_SHAPE_P_FILE']} loaded", flush=True)
             if hasattr(_esimd, "linear"):
                 # symbolic-shape-aware fake impl (a C++ Meta kernel would specialise the token dim)
                 @torch.library.register_fake("exl3xpu_C::linear")
