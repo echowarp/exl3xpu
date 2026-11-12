@@ -1,4 +1,4 @@
-"""Cheaper MTP drafter for the Arc (exl3xpu).
+"""Cheaper MTP drafter for the Arc (exl3xpu), + DRAFT-DYN / context bias.
 
 DS-SUB (EXL3_DS_SUB=1): draft tokens are sampled from the pruned draft head's compact logits (512 / 128 vocab blocks
 x 128 ids) with exl3xpu_C::exl3_draft_sample_sub, instead of a -inf-filled 248,320-wide row + index_copy + the
@@ -44,6 +44,106 @@ def _head_for_pass(lm, k):
     return far if (far is not None and k >= _FAR_FROM) else d
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# DRAFT-DYN + context bias (probabilistic-exact; see draftdyn.py)
+
+_DYN_ON = os.environ.get("EXL3_DRAFT_DYN", "0") != "0" or os.environ.get("EXL3_DRAFT_BIAS", "0") not in ("0", "")
+_DYN: dict = {"rids": None, "cache": {}, "keep": [], "stats": {"dyn": 0, "skip": 0, "upd": 0, "n": 0}}
+
+
+def _dyn_heads(lm):
+    return [d for d in (getattr(lm, "exl3_draft", None), getattr(lm, "exl3_draft_far", None))
+            if d is not None and d.get("dyn") is not None]
+
+
+def _pinned(a):
+    t = torch.from_numpy(a)
+    try:
+        return t.pin_memory()
+    except Exception:  # noqa
+        return t
+
+
+def _dyn_set_batch(runner):
+    """Rewrite the per-batch-row DYN/bias buffers when the batch's request rows change (outside any graph capture).
+    Row i of every buffer describes input_batch row i; dy["B"] = the batch size the buffers are valid for (the sampler
+    applies DYN only when the drafter's batch has exactly that many rows, else the static head alone: still exact)."""
+    from .draftdyn import assemble, rows_for_request, static_pos_map
+    lm = getattr(getattr(runner.drafter, "model", None), "lm_head", None)
+    heads = _dyn_heads(lm) if lm is not None else []
+    if not heads:
+        return
+    rids = tuple(runner.input_batch.req_ids)
+    if rids == _DYN["rids"]:
+        return
+    vocab = runner.model_config.get_vocab_size()
+    cache = _DYN["cache"]
+    for d in heads:
+        dy = d["dyn"]
+        if "pos" not in dy:
+            dy["pos"] = static_pos_map(d["idx"], max(vocab, int(d["idx"].max()) + 1))
+    entries = []
+    for r in rids:
+        x = cache.get(r)
+        if x is None:
+            st = runner.requests.get(r)
+            ptoks = (st.prompt_token_ids or []) if st is not None else []
+            x = cache[r] = [rows_for_request(ptoks, d["dyn"]["pos"], d["dyn"]["E"], vocab) for d in heads]
+        entries.append(x)
+    for r in [r for r in cache if r not in runner.requests]:
+        cache.pop(r)
+    B = len(rids)
+    keep = []
+    for hi, d in enumerate(heads):
+        dy = d["dyn"]
+        if B == 0 or B > dy["S"]:
+            dy["B"] = 0
+            continue
+        a = assemble([e[hi] for e in entries], dy["E"], dy["Ns"], dy["beta"], host=dy["host"], gs=dy["gs"])
+        n = B * dy["E"]
+        if a["SB"] is not None:
+            src = _pinned(a["SB"]); keep.append(src); dy["SB"][:B].copy_(src, non_blocking=True)
+        if dy["E"] > 0:
+            for name, arr in (("X", a["X"]), ("XB", a["XB"])):
+                src = _pinned(arr); keep.append(src); dy[name][:B].copy_(src, non_blocking=True)
+            src = _pinned(a["Wq"]); keep.append(src); dy["Wq"][:n].copy_(src, non_blocking=True)
+            src = _pinned(a["Ws"].reshape(-1)); keep.append(src); dy["Ws"][:dy["G"] * n].copy_(src, non_blocking=True)
+            src = _pinned(a["Wz"].reshape(-1)); keep.append(src); dy["Wz"][:dy["G"] * n].copy_(src, non_blocking=True)
+        dy["B"] = B
+    _DYN["keep"].append(keep)
+    _DYN["keep"] = _DYN["keep"][-8:]      # pinned sources stay alive until their async copies are surely done
+    _DYN["rids"] = rids
+    _DYN["stats"]["upd"] += 1
+
+
+def _dyn_logits(d, dy, sub, h, B):
+    """Static logits (+ bias) and, with E > 0, the rows' extra logits (+ bias, pads -inf) as one [B, Ns + E] row."""
+    if dy["E"] <= 0:
+        return sub + dy["SB"][:B] if dy["beta"] else sub
+    Ns, E, G = dy["Ns"], dy["E"], dy["G"]
+    L = dy["L"][:B]
+    if dy["beta"]:
+        torch.add(sub, dy["SB"][:B], out=L[:, :Ns])
+    else:
+        L[:, :Ns].copy_(sub)
+    n = B * E
+    ex = torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(
+        h if h.dtype == torch.float16 else h.half(), dy["Wq"][:n], dy["gs"], dy["Ws"][:G * n].view(G, n),
+        dy["Wz"][:G * n].view(G, n))
+    ex = ex.view(B, B, E).diagonal(dim1=0, dim2=1).t()      # row b's own extra rows (B x B*E computed, diagonal kept)
+    torch.add(ex, dy["XB"][:B], out=L[:, Ns:])
+    return L
+
+
+def _dyn_count(kind):
+    st = _DYN["stats"]
+    st[kind] += 1; st["n"] += 1
+    if st["n"] % 5000 == 0:
+        logger.info("exl3: DRAFT-DYN last 5000 draft passes: %d with DYN/bias, %d static only; %d batch updates",
+                    st["dyn"], st["skip"], st["upd"])
+        st.update(dyn=0, skip=0, upd=0)
+
+
 def _sub_sample(proposer, hidden_states, sampling_metadata):
     """Returns (token_ids int64 [B], probs float32 [B, V] or None for greedy), or None if not applicable."""
     model = proposer.model
@@ -59,6 +159,30 @@ def _sub_sample(proposer, hidden_states, sampling_metadata):
     if idx is None:
         idx = d["idx_long"] = d["idx"].to(torch.int64).contiguous()
     vocab = model.config.vocab_size
+    dy = d.get("dyn") if _DYN_ON else None
+    if dy is not None:
+        B = hidden_states.shape[0]
+        if dy["B"] == B:
+            _dyn_count("dyn")
+            from .draftdyn import ext_index, finish_greedy, finish_sample
+            sub = _dyn_logits(d, dy, sub, hidden_states, B)
+            if dy["E"] > 0:
+                X = dy["X"][:B]
+                if sampling_metadata.all_greedy:
+                    return finish_greedy(sub, idx, X), None
+                ie = dy.get("idx_ext")
+                if ie is None or ie.numel() != sub.shape[1]:
+                    ie = dy["idx_ext"] = ext_index(idx, vocab, dy["E"])
+                probs = torch.zeros(B, vocab + dy["E"], dtype=torch.float32, device=sub.device)
+                tok = torch.empty(B, dtype=torch.int64, device=sub.device)
+                temp = sampling_metadata.temperature
+                temp = (temp if temp.dtype == torch.float32 else temp.float()).contiguous()
+                ctr, seed = _rng(sub.device)
+                torch.ops.exl3xpu_C.exl3_draft_sample_sub(sub, ie, temp, probs, tok, ctr, seed, k)
+                ctr.add_(1)
+                return finish_sample(tok, probs, X, vocab)
+        else:
+            _dyn_count("skip")
     if sampling_metadata.all_greedy:
         am = sub.argmax(dim=-1)
         return idx.index_select(0, am), None
@@ -346,6 +470,35 @@ def _patch_graph():
     logger.info("exl3: DRAFT-GRAPH installed (captured draft passes 2..k, max %d graphs)", _MAX_GRAPHS)
 
 
+def _patch_dyn():
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as R
+    orig = R.propose_draft_token_ids
+
+    def propose_draft_token_ids(self, *a, **k):
+        try:
+            _dyn_set_batch(self)
+        except Exception as e:  # noqa
+            logger.warning("exl3: DRAFT-DYN batch update failed (%r); static heads only from now on", e)
+            for d in _dyn_heads(getattr(getattr(self.drafter, "model", None), "lm_head", None)):
+                d["dyn"]["B"] = 0
+            _DYN["rids"] = None
+            R.propose_draft_token_ids = orig
+        return orig(self, *a, **k)
+
+    R.propose_draft_token_ids = propose_draft_token_ids
+    logger.info("exl3: DRAFT-DYN batch hook installed (DYN %s, near %s, bias %s)", os.environ.get("EXL3_DRAFT_DYN", "0"),
+                os.environ.get("EXL3_DRAFT_DYN_NEAR", "="), os.environ.get("EXL3_DRAFT_BIAS", "0"))
+
+
+def patch():
+    if _DYN_ON:
+        if not _DS_SUB:
+            logger.warning("exl3: DRAFT-DYN/BIAS need EXL3_DS_SUB=1; not installed")
+        else:
+            try:
+                _patch_dyn()
+            except Exception as e:  # noqa
+                logger.warning("exl3: DRAFT-DYN not installed (%r)", e)
     if _DS_SUB or _GRAPH:
         try:
             _patch_sample()

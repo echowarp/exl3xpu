@@ -259,6 +259,9 @@ class Exl3LinearMethod(LinearMethodBase):
             for attr in attrs:
                 if getattr(layer, attr, None) is not None:
                     _build_draft_q4(layer, getattr(layer, attr), int(os.environ["EXL3_DRAFT_Q4"]))
+        if isinstance(layer, ParallelLMHead) and getattr(layer, "exl3_draft", None) is not None and (
+                os.environ.get("EXL3_DRAFT_DYN", "0") != "0" or os.environ.get("EXL3_DRAFT_BIAS", "0") not in ("0", "")):
+            _build_draft_dyn(layer)   # DRAFT-DYN + context bias, probabilistic-exact
         # decide the backend once, outside any traced code: the all-C++ op when the ESIMD library has it
         from . import ops
         E = ops._get_esimd()
@@ -454,6 +457,88 @@ def _build_draft_q4(layer, d, gs):
     torch.xpu.empty_cache()
     logger.info("exl3: DRAFT-Q4 head: %d x %d int4, group %d (%.1f MB; max abs dequant err %.2e)",
                 N, K, gs, (packed.numel() * 4 + scales.numel() * 3) / 1e6, err)
+
+
+_DYN_HOST: dict = {}
+
+
+def _dyn_host_table(layer, gs):
+    """DRAFT-DYN: the whole lm_head as per-row int4 g{gs} rows on the host (packed [V, K/8] int32, scales [V, G]
+    fp16, zeros [V, G] int8; ~0.7 GB RAM for the 27B), built in 128-block chunks through the EXL3 kernel (identity rows,
+    as _build_draft_q4) so it quantizes exactly what DRAFT-Q4 quantizes. Built once per process: the MTP drafter shares
+    the target's lm_head (vLLM "Sharing target model lm_head weights"), a second ParallelLMHead with the same svh reuses it."""
+    from . import ops
+    from .draftdyn import quantize_rows_int4
+    key = (tuple(layer.svh.shape), gs)
+    hit = _DYN_HOST.get(key)
+    if hit is not None and torch.equal(hit["svh"], layer.svh.data[:4096].cpu()):
+        return hit["table"]
+    K = layer.suh.shape[-1]
+    n_blocks = layer.svh.shape[0] // 128
+    dev = layer.trellis.device
+    parts = ([], [], [])
+    for b0 in range(0, n_blocks, 128):
+        blocks = torch.arange(b0, min(n_blocks, b0 + 128), dtype=torch.long)
+        tiles = (blocks[:, None] * 8 + torch.arange(8)[None, :]).flatten().to(dev)
+        trellis = layer.trellis.data.index_select(1, tiles).contiguous()
+        svh = layer.svh.data.view(-1, 128).index_select(0, blocks.to(dev)).flatten().contiguous()
+        N = len(blocks) * 128
+        shard = torch.zeros(len(blocks), dtype=torch.int32, device=dev)
+        wt = torch.empty(K, N, dtype=torch.float16, device=dev)
+        for a in range(0, K, 256):
+            eye = torch.zeros(min(256, K - a), K, dtype=torch.float16, device=dev)
+            eye[torch.arange(eye.shape[0]), torch.arange(a, a + eye.shape[0])] = 1
+            wt[a:a + eye.shape[0]] = torch.ops.exl3xpu_C.linear(eye, trellis, layer.suh, svh, shard, [0, N],
+                                                                 layer.exl3_K, layer.exl3_cb, ops.SMALL_M_MAX,
+                                                                 ops.RECON_SLICE_N)
+        for r0 in range(0, N, 4096):
+            q, s_, z = quantize_rows_int4(wt[:, r0:r0 + 4096].t(), gs)
+            parts[0].append(q.cpu()); parts[1].append(s_.cpu()); parts[2].append(z.cpu())
+        del wt, trellis, svh
+    torch.xpu.empty_cache()
+    table = tuple(torch.cat(x).numpy() for x in parts)
+    _DYN_HOST[key] = dict(svh=layer.svh.data[:4096].cpu(), table=table)
+    logger.info("exl3: DRAFT-DYN host int4 lm_head: %d x %d, group %d (%.0f MB host)", table[0].shape[0], K, gs,
+                sum(x.nbytes for x in table) / 1e6)
+    return table
+
+
+def _build_draft_dyn(layer):
+    """Persistent per-batch-row buffers for DRAFT-DYN / context bias on both draft heads, allocated
+    at load (before vLLM sizes the KV cache). See draftdyn.py and draftgraph._dyn_set_batch / _sub_sample."""
+    E_far = int(os.environ.get("EXL3_DRAFT_DYN", "0"))
+    E_near = int(os.environ.get("EXL3_DRAFT_DYN_NEAR", str(E_far)))
+    beta = float(os.environ.get("EXL3_DRAFT_BIAS", "0") or 0)
+    gs = int(os.environ.get("EXL3_DRAFT_Q4", "64") or 64)
+    try:
+        from vllm.config import get_current_vllm_config
+        S = int(get_current_vllm_config().scheduler_config.max_num_seqs)
+    except Exception:  # noqa
+        S = 16
+    dev = layer.suh.device
+    K = layer.suh.shape[-1]
+    G = K // gs
+    host = _dyn_host_table(layer, gs) if max(E_far, E_near) > 0 else None
+    mb = 0.0
+    for attr, E in (("exl3_draft", E_near), ("exl3_draft_far", E_far)):
+        d = getattr(layer, attr, None)
+        if d is None:
+            continue
+        Ns = d["idx"].numel()
+        dy = dict(E=E, Ns=Ns, S=S, beta=beta, gs=gs, G=G, B=0, host=host if E > 0 else None)
+        if beta:
+            dy["SB"] = torch.zeros(S, Ns, dtype=torch.float16, device=dev)
+        if E > 0:
+            dy["X"] = torch.zeros(S, E, dtype=torch.int64, device=dev)
+            dy["XB"] = torch.full((S, E), float("-inf"), dtype=torch.float16, device=dev)
+            dy["L"] = torch.empty(S, Ns + E, dtype=torch.float16, device=dev)
+            dy["Wq"] = torch.zeros(S * E, K // 8, dtype=torch.int32, device=dev)
+            dy["Ws"] = torch.zeros(G * S * E, dtype=torch.float16, device=dev)
+            dy["Wz"] = torch.zeros(G * S * E, dtype=torch.int8, device=dev)
+        mb += sum(v.numel() * v.element_size() for v in dy.values() if isinstance(v, torch.Tensor)) / 1e6
+        d["dyn"] = dy
+    logger.info("exl3: DRAFT-DYN buffers: near E=%d, far E=%d, bias %.2f, %d rows (%.1f MB device)",
+                E_near, E_far, beta, S, mb)
 
 
 def draft_sub_logits(lm, d, h):

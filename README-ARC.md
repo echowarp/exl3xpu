@@ -77,6 +77,9 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_DS_SUB` | 1 | DS-SUB: draft tokens sampled from the pruned head's compact logits (`exl3_draft_sample_sub`, device RNG counter) |
 | `EXL3_DRAFT_GRAPH` | default (0) | DRAFT-GRAPH: draft passes 2..k as one captured XPU graph (needs DS-SUB) |
 | `EXL3_DRAFT_GRAPH_MAX / _CHECK` | default (24 / 0) | graph count cap; debug comparison against the eager loop |
+| `EXL3_DRAFT_DYN` | 256 | DRAFT-DYN: up to N extra far-head rows per request (its most frequent prompt tokens outside the static head; int4 rows gathered from a host copy of lm_head) |
+| `EXL3_DRAFT_DYN_NEAR` | 128 | the same for the near head |
+| `EXL3_DRAFT_BIAS` | 0 | drafter logit bias on prompt tokens (0 = off) |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
@@ -108,5 +111,6 @@ Nothing derived from traffic ships with this fork. The production values above p
 | `scripts/build_arc.sh` | builds the kernel libraries with the production options |
 | `csrc/` | ESIMD/SYCL kernels of `_C.so` (upstream files extended; new headers per feature) |
 | `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` | B70 split-K table for the decode linears |
+| `exl3xpu/draftdyn.py` | DRAFT-DYN row selection / batch assembly / sample fix-up (CPU-testable) |
 | `exl3xpu/draftgraph.py` | DS-SUB and DRAFT-GRAPH |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |
