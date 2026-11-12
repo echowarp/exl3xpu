@@ -20,6 +20,12 @@ build_c() {
   EXL3_FLAGS="${EXL3_FLAGS:-$EXL3_ARC_FLAGS}" EXL3_OUT="${EXL3_OUT:-exl3xpu/_C.so}" bash scripts/build_ext.sh
 }
 
+# setvars.sh is not nounset-safe: under `set -u` it aborts the script silently. Source it only when icpx is missing.
+oneapi_env() {
+  command -v icpx >/dev/null 2>&1 && return 0
+  set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true; set -u
+}
+
 torch_flags() {
   T=$(python3 -c "import torch,os;print(os.path.dirname(torch.__file__))")
   TORCH_INC="-I$T/include -I$T/include/torch/csrc/api/include"
@@ -31,7 +37,7 @@ torch_flags() {
 # device code for the B70 (bmg-g31).
 GDNC_ARC_FLAGS="-DGDNC_PF=1 -DGDNC_PF_DIST=2 -DGDNC_PF_QK256=1 -DGDNC_CONV2=1 -DGDNC_VNNI2D=1 -DGDNC_PLANPAR=1 -DGDNC_CONV_VEC=4"
 build_gdnchunk() {
-  source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+  oneapi_env
   torch_flags
   local targets=spir64; local aot=()
   if [ "${AOT:-0}" = 1 ]; then targets=spir64_gen; aot=(-Xs "-device bmg-g31"); fi
@@ -44,7 +50,7 @@ build_gdnchunk() {
 
 # ng.so (torch library exl3ng): fused NaN guard. Built WITHOUT -ffast-math (isnan / isinf must survive).
 build_ng() {
-  source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+  oneapi_env
   torch_flags
   icpx -fsycl -fsycl-targets=spir64 -O3 -fPIC -std=c++17 -shared -D_GLIBCXX_USE_CXX11_ABI=1 \
     $TORCH_INC -x c++ ng/ng_ops.sycl -x none -o ${NG_OUT:-exl3xpu/ng.so} $TORCH_LIB -Wno-deprecated-declarations
