@@ -6,6 +6,10 @@
 #include "exl3_esimd.h"
 #include "fa_esimd.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include "norm_sycl.h"
+static int g_norm_wg = 128;
+static int exl3_norm_wg() { return g_norm_wg; }
+static void exl3_set_norm_wg(int64_t n) { g_norm_wg = (int)n; }
 
 using namespace exl3;
 
@@ -794,6 +798,21 @@ void exl3_stream_probe(at::Tensor trellis, at::Tensor out, int64_t M) {
     q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), k); });
 }
 
+// ---- fused residual add + RMSNorm (decode, small M), see norm_sycl.h
+void exl3_fused_add_rms_norm(at::Tensor x, at::Tensor residual, at::Tensor weight, double eps) {
+    TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kHalf && x.stride(1) == 1);
+    TORCH_CHECK(residual.sizes() == x.sizes() && residual.scalar_type() == at::kHalf && residual.stride(1) == 1);
+    TORCH_CHECK(weight.scalar_type() == at::kHalf && weight.is_contiguous() && weight.numel() == x.size(1));
+    int M = x.size(0), H = x.size(1);
+    TORCH_CHECK(H % exl3norm::VEC == 0);
+    if (M == 0) return;
+    auto& q = queue_of(x);
+    exl3norm::FusedAddRms k{reinterpret_cast<sycl::half*>(x.data_ptr<at::Half>()), reinterpret_cast<sycl::half*>(residual.data_ptr<at::Half>()),
+                            reinterpret_cast<const sycl::half*>(weight.data_ptr<at::Half>()), H, (int)x.stride(0), (int)residual.stride(0), (float)eps};
+    int L = exl3_norm_wg();
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)M * L, L), k); });
+}
+
 // ---- fused MLP for decode batches (3 <= M <= 8, DPAS MB=8): had_in -> gate_up DPAS -> MlpMid -> down DPAS -> had_out
 template <int K>
 static at::Tensor dpas8_parts(const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard, int M, int Kdim, int N,
@@ -1177,4 +1196,7 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("mlp_auto(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, int[] gu_bounds, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, int[] dn_bounds, int K_gu, int K_dn, int cb, int small_m_max, int slice_n) -> Tensor");
     m.impl("mlp_auto", torch::kXPU, &exl3_mlp_auto);
     m.impl("exl3_fa_fwd", torch::kXPU, &exl3_fa_fwd);
+    m.def("exl3_fused_add_rms_norm(Tensor(a!) x, Tensor(b!) residual, Tensor weight, float eps) -> ()");
+    m.impl("exl3_fused_add_rms_norm", torch::kXPU, &exl3_fused_add_rms_norm);
+    m.def("exl3_set_norm_wg(int n) -> ()", &exl3_set_norm_wg);
 }

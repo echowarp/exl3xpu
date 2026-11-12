@@ -41,6 +41,8 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_SHAPE_P_FILE` | `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` | per-shape split-K count (and NT override) table for the decode linears, keyed `"N,K,MB"`; measured on a B70 |
 | `EXL3_Q8_FOLD_MIN_M` | default (off) | int8 prefill GEMM: output Hadamard folded into the int8 weights from this many rows (setting it turns the fold on) |
 | `EXL3_FUSED_MLP` | default (1) | fused decode MLP (`mlp_auto`: 3..8 rows in one op; prefill MLP middle fused for int8 prefill) |
+| `EXL3_FAST_NORM` | default (1) | fused residual add + RMSNorm for decode batches (replaces `custom_esimd_kernels_vllm.esimd_fused_add_rms_norm_batched`) |
+| `EXL3_FAST_NORM_WG` | default (256) | work-group size of that kernel |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule

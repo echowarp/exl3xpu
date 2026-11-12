@@ -468,11 +468,46 @@ def _patch_fused_mlp():
     logger.info("exl3: fused decode MLP enabled (3..8 rows)")
 
 
+def _patch_fast_norm():
+    """Residual add + RMSNorm for decode batches via exl3xpu_C::exl3_fused_add_rms_norm
+    (one work-group per row, 256 threads) instead of custom_esimd_kernels_vllm.esimd_fused_add_rms_norm_batched:
+    2.8 vs 8.4 us device time at M=6, 3.6 vs 10.9 at M=18 (microbenchmark), 138 calls per decode step; exact vLLM
+    fused_add_rms_norm semantics (the ESIMD op is 1-2 ulp off the fp32 reference). layernorm.py looks the ESIMD op up
+    by attribute on every call, so replacing the attribute reroutes it. EXL3_FAST_NORM=0 disables."""
+    if os.environ.get("EXL3_FAST_NORM", "1") != "1":
+        return
+    try:
+        import importlib
+        from . import ops
+        E = ops._get_esimd()
+        if not E or not hasattr(torch.ops.exl3xpu_C, "exl3_fused_add_rms_norm"):
+            return
+        mod = importlib.import_module("custom_esimd_kernels_vllm")
+    except Exception as e:  # noqa
+        logger.info("exl3: fast RMSNorm not available here (%s)", e)
+        return
+    if getattr(mod, "_exl3_norm_patched", False):
+        return
+    try:
+        torch.ops.exl3xpu_C.exl3_set_norm_wg(int(os.environ.get("EXL3_FAST_NORM_WG", "256")))
+    except Exception:
+        pass
+    _op = torch.ops.exl3xpu_C.exl3_fused_add_rms_norm
+
+    def esimd_fused_add_rms_norm_batched(x, residual, weight, eps):
+        _op(x, residual, weight, float(eps))
+
+    mod.esimd_fused_add_rms_norm_batched = esimd_fused_add_rms_norm_batched
+    mod._exl3_norm_patched = True
+    logger.info("exl3: fast fused add+RMSNorm enabled (decode batches)")
+
+
 
 
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     _patch_fused_mlp()
+    _patch_fast_norm()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()
     if os.environ.get("EXL3_VLLM_PATCHES", "1") != "0":
