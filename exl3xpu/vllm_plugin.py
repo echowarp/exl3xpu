@@ -1014,6 +1014,9 @@ def register():
     _patch_fused_mlp()
     _patch_fast_norm()
     _patch_int8kv_fast()
+    if os.environ.get("EXL3_DS_SUB", "0") == "1" or os.environ.get("EXL3_DRAFT_GRAPH", "0") == "1":
+        from . import draftgraph   # DS-SUB / DRAFT-GRAPH (before the graded-vocab propose wrapper)
+        draftgraph.patch()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()
     if os.environ.get("EXL3_VLLM_PATCHES", "1") != "0":

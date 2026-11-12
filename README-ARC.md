@@ -73,6 +73,10 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_DRAFT_Q4` | 64 | DRAFT-Q4: the draft heads as plain int4 (group size 64) for torch's XPU int4 GEMV; drafter only |
 | `EXL3_DRAFT_Q4_SCOPE` | default (all) | `far`: int4 only for the far head |
 | `EXL3_DRAFT_Q4_KEEP` | default (0) | keep the EXL3 slice next to the int4 head |
+| `EXL3_FAST_DRAFT_SAMPLE` | default (1) | fused draft sampler `exl3_draft_sample` (vLLM patch: `llm_base_proposer.py`) |
+| `EXL3_DS_SUB` | 1 | DS-SUB: draft tokens sampled from the pruned head's compact logits (`exl3_draft_sample_sub`, device RNG counter) |
+| `EXL3_DRAFT_GRAPH` | default (0) | DRAFT-GRAPH: draft passes 2..k as one captured XPU graph (needs DS-SUB) |
+| `EXL3_DRAFT_GRAPH_MAX / _CHECK` | default (24 / 0) | graph count cap; debug comparison against the eager loop |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
@@ -104,4 +108,5 @@ Nothing derived from traffic ships with this fork. The production values above p
 | `scripts/build_arc.sh` | builds the kernel libraries with the production options |
 | `csrc/` | ESIMD/SYCL kernels of `_C.so` (upstream files extended; new headers per feature) |
 | `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` | B70 split-K table for the decode linears |
+| `exl3xpu/draftgraph.py` | DS-SUB and DRAFT-GRAPH |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |

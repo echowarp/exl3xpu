@@ -32,6 +32,13 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.```
 
+## vLLM (Apache-2.0)
+
+`exl3xpu/draftgraph.py` (DRAFT-GRAPH) re-creates, at run time, the draft loop of vLLM's
+`SpecDecodeBaseProposer.propose` (vllm/v1/spec_decode/llm_base_proposer.py, vLLM 0.26) from vLLM's own source and
+mirrors its per-pass steps in the captured graph body. vLLM is https://github.com/vllm-project/vllm, Copyright the
+vLLM authors, licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
 ## Intel oneAPI / oneDNN, PyTorch
 
 The kernels are built with Intel's oneAPI DPC++/C++ compiler and link against oneDNN and PyTorch (torch XPU); none of
