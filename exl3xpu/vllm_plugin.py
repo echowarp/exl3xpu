@@ -130,7 +130,10 @@ class Exl3Config(QuantizationConfig):
         bits = [self.storage.get(n) for n in names]
         if all(b is None for b in bits):
             return None
-        assert all(b == bits[0] for b in bits), f"exl3: mixed quant in fused module {prefix}: {bits}"
+        if any(b != bits[0] for b in bits):
+            # mixed-precision checkpoints (e.g. turboderp SC_*_H5): one EXL3 call per equal-K run of members
+            assert all(b is not None for b in bits), f"exl3: partly quantized fused module {prefix}: {bits}"
+            return tuple(bits)
         return bits[0]
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -138,6 +141,8 @@ class Exl3Config(QuantizationConfig):
             bits = self._bits_for(prefix)
             if bits is None:
                 return UnquantizedLinearMethod()
+            if isinstance(bits, tuple):
+                return Exl3MixedLinearMethod(self, bits)
             return Exl3LinearMethod(self, bits)
         if isinstance(layer, ParallelLMHead):
             bits = self._bits_for(prefix)
@@ -261,6 +266,99 @@ class Exl3LinearMethod(LinearMethodBase):
         return y
 
     # lm_head (ParallelLMHead) path
+    def embedding(self, layer, input_):
+        raise NotImplementedError("exl3: quantized input embeddings are not supported")
+
+
+class Exl3MixedLinearMethod(LinearMethodBase):
+    """Fused module whose checkpoint members have different bit widths. Each loaded
+    checkpoint tensor is kept as its own group (own trellis K, suh, svh); consecutive groups with equal K are
+    concatenated into one EXL3 call, and apply() concatenates the call outputs along the output dim."""
+
+    def __init__(self, config: Exl3Config, bits: tuple):
+        self.config = config
+        self.bits = bits
+        self.cb = CB_IDS[config.codebook]
+
+    def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size,
+                       output_size, params_dtype, **extra_weight_attrs):
+        k = input_size_per_partition
+        if k != input_size:
+            raise NotImplementedError("exl3: tensor parallel sharding not supported yet (use DP)")
+        layer.exl3_sizes = list(output_partition_sizes)
+        layer.exl3_offsets = [sum(output_partition_sizes[:i]) for i in range(len(output_partition_sizes) + 1)]
+        layer.exl3_mx = {}                 # group (tuple of partition ids) -> {"tr", "suh", "svh"}
+        layer.exl3_cb = self.cb
+        layer.exl3_k_in = k
+
+        def reg(name, loader):
+            p = Parameter(torch.empty(1, dtype=torch.int16 if name == "trellis" else torch.float16),
+                          requires_grad=False)
+            p.weight_loader = loader
+            layer.register_parameter(name, p)
+
+        def store(key):
+            def f(param, w, sid=None):
+                s = tuple(Exl3LinearMethod._shards(layer, w, sid))
+                layer.exl3_mx.setdefault(s, {})[key] = w.to(param.device)
+            return f
+        reg("trellis", store("tr"))
+        reg("suh", store("suh"))
+        reg("svh", store("svh"))
+        if self.config.codebook != "3inst":
+            p = Parameter(torch.empty((), dtype=torch.int32), requires_grad=False)
+            p.weight_loader = lambda p, w, *a, **kw: p.data.copy_(w)
+            layer.register_parameter(self.config.codebook, p)
+
+    def process_weights_after_loading(self, layer):
+        groups = sorted(layer.exl3_mx)
+        covered = [i for g in groups for i in g]
+        assert covered == list(range(len(layer.exl3_sizes))), f"exl3: incomplete shards {groups}"
+        cb = self.cb
+        if hasattr(layer, "mcg"):
+            cb = 1
+        elif hasattr(layer, "mul1"):
+            cb = 2
+        from . import ops
+        E = ops._get_esimd()
+        calls, run = [], []
+
+        def flush():
+            if not run:
+                return
+            K = run[0]["tr"].shape[-1] // 16
+            tr = torch.cat([g["tr"] for g in run], dim=1).contiguous() if len(run) > 1 else run[0]["tr"].contiguous()
+            suh = torch.stack([g["suh"] for g in run]).contiguous()
+            svh = torch.cat([g["svh"] for g in run]).contiguous()
+            widths = [g["tr"].shape[1] * 16 for g in run]
+            bounds = [sum(widths[:i]) for i in range(len(widths) + 1)]
+            shard = torch.cat([torch.full((w // 128,), i, dtype=torch.int32) for i, w in enumerate(widths)])
+            assert bool(E) and E.exl3_supported(K, cb), f"exl3: K={K} cb={cb} needs an EXL3_ALL_CODEBOOKS build"
+            calls.append(dict(tr=tr, suh=suh, svh=svh, shard=shard.to(tr.device), bounds=bounds, K=K))
+            run.clear()
+        for g in groups:
+            d = layer.exl3_mx[g]
+            if run and run[0]["tr"].shape[-1] != d["tr"].shape[-1]:
+                flush()
+            run.append(d)
+        flush()
+        layer.exl3_calls = calls
+        layer.exl3_cb = cb
+        layer.exl3_mx = None
+        for name in ("trellis", "suh", "svh"):
+            delattr(layer, name)
+        logger.debug("exl3: mixed fused module, K per call %s", [c["K"] for c in calls])
+
+    def apply(self, layer, x, bias=None):
+        from . import ops
+        ys = [torch.ops.exl3xpu_C.linear(x, c["tr"], c["suh"], c["svh"], c["shard"], c["bounds"], c["K"],
+                                         layer.exl3_cb, ops.SMALL_M_MAX, ops.RECON_SLICE_N)
+              for c in layer.exl3_calls]
+        y = ys[0] if len(ys) == 1 else torch.cat(ys, dim=-1)
+        if bias is not None:
+            y = y + bias
+        return y
+
     def embedding(self, layer, input_):
         raise NotImplementedError("exl3: quantized input embeddings are not supported")
 
