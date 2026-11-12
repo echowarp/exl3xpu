@@ -98,6 +98,8 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_NG_SO` | default (`exl3xpu/ng.so`) | NaN-guard library |
 | `EXL3_LAZY_VISION` | 1 | vision tower in pinned host RAM, loaded (or streamed block by block) only for image requests; vLLM patch: `qwen3_vl.py` calls `exl3xpu.lazyvis.install()` |
 | `EXL3_LAZY_VISION_MODE / _TTL / _MARGIN_MB` | default (auto / 120 / 256) | resident vs streamed policy, release after idle seconds, free-memory margin |
+| `EXL3_NOMMAP_LOAD` | default (1) | safetensors weights read with preadv, no mmap |
+| `EXL3_NOMMAP_DROP` | default (0) | also drop the read pages from the page cache |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
@@ -134,4 +136,5 @@ Nothing derived from traffic ships with this fork. The production values above p
 | `gdnchunk/` | GDN chunked prefill port (Apache-2.0, derived from Magnitude; own `LICENSE` and `NOTICE`) |
 | `ng/ng_ops.sycl` | fused NaN guard library |
 | `exl3xpu/lazyvis.py` | lazy vision tower |
+| `exl3xpu/nommap_loader.py` | weight loading without mmap |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |

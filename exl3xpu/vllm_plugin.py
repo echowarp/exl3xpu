@@ -1636,6 +1636,11 @@ def register():
             print("exl3xpu: torch deterministic algorithms ON (EXL3_DETERMINISTIC=1)", flush=True)
         except Exception as e:  # noqa
             print(f"exl3xpu: deterministic algorithms not enabled ({e!r})", flush=True)
+    try:                                   # weight loading without mmap (nommap_loader.py)
+        from . import nommap_loader
+        nommap_loader.patch()
+    except Exception as e:  # noqa: fall back to vLLM's mmap loader
+        print(f"exl3xpu: nommap loader not installed ({e!r}); using vLLM's safetensors loader", flush=True)
     _patch_fused_mlp()
     _patch_fast_norm()
     _patch_det_linear()
