@@ -1,0 +1,12 @@
+gdnchunk (Arc B70 / Xe2 SYCL+ESIMD port of Magnitude's gated delta rule chunk kernel), part of the exl3xpu Arc B70 fork
+
+csrc/gdn_chunk_sycl.h is a modified port of Magnitude (https://github.com/magnitudedev/magnitude,
+commit 7f029060a37ed1f7884db038222dc8f36430a08e):
+  inference/engine/kernels/kernels/cuda/gated_delta_chunk.cu
+  inference/engine/kernels/kernels/cuda/lib/recurrent/recurrent.cuh
+  (contract: inference/engine/kernels/kernels/recurrent.seismic, gated_delta_chunk)
+Copyright 2026 Magnitude AI Inc. Licensed under the Apache License, Version 2.0 (LICENSE in this directory).
+Modifications (2026, exl3xpu Arc B70 fork): listed in the header of csrc/gdn_chunk_sycl.h.
+No Magnitude source file is copied unmodified into this directory.
+
+The checkpoint / partial-reload contract follows the CUDA port of the same kernel (exl3cuda, csrc/gdnchunk/gdn_chunk.cu).

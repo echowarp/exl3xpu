@@ -39,6 +39,16 @@ SOFTWARE.```
 mirrors its per-pass steps in the captured graph body. vLLM is https://github.com/vllm-project/vllm, Copyright the
 vLLM authors, licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
 
+## Magnitude (Apache-2.0)
+
+`gdnchunk/csrc/gdn_chunk_sycl.h` is a modified port (CUDA to SYCL/ESIMD for Xe2) of Magnitude's gated delta rule
+chunk kernel, from https://github.com/magnitudedev/magnitude (commit 7f029060a37ed1f7884db038222dc8f36430a08e):
+`inference/engine/kernels/kernels/cuda/gated_delta_chunk.cu` and `lib/recurrent/recurrent.cuh`.
+Copyright 2026 Magnitude AI Inc., licensed under the Apache License, Version 2.0: full text in `gdnchunk/LICENSE`,
+attribution in `gdnchunk/NOTICE`; the modifications are listed in the header of `gdn_chunk_sycl.h`.
+`gdnchunk/csrc/gdn_chunk_ops.sycl` (the torch bindings) is new code of this fork, also under Apache-2.0
+(SPDX header). No Magnitude file is copied unmodified.
+
 ## Intel oneAPI / oneDNN, PyTorch
 
 The kernels are built with Intel's oneAPI DPC++/C++ compiler and link against oneDNN and PyTorch (torch XPU); none of

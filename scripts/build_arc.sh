@@ -2,7 +2,7 @@
 # Build the Arc B70 kernel libraries of this fork inside an environment that has the oneAPI DPC++/C++ compiler (icpx),
 # oneDNN and the XPU build of PyTorch, e.g. the upstream image (docker/Dockerfile).
 #
-#   scripts/build_arc.sh [c|all]      (default: all)
+#   scripts/build_arc.sh [c|gdnchunk|all]      (default: all)
 #
 # Toolchain of the production build: Intel oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319), oneDNN 3.9.1,
 # PyTorch 2.12.0+xpu, as shipped in intel/llm-scaler-vllm:0.26.0-b2 (the upstream base image). All libraries are
@@ -20,9 +20,33 @@ build_c() {
   EXL3_FLAGS="${EXL3_FLAGS:-$EXL3_ARC_FLAGS}" EXL3_OUT="${EXL3_OUT:-exl3xpu/_C.so}" bash scripts/build_ext.sh
 }
 
+torch_flags() {
+  T=$(python3 -c "import torch,os;print(os.path.dirname(torch.__file__))")
+  TORCH_INC="-I$T/include -I$T/include/torch/csrc/api/include"
+  TORCH_LIB="-L$T/lib -Wl,-rpath,$T/lib -lc10 -ltorch -ltorch_cpu -lc10_xpu -ltorch_xpu"
+}
+
+# gdnchunk.so (torch library gdnchunk): GDN prefill port (gdnchunk/, Apache-2.0). GDNC_FLAGS default = the options of
+# the production build as documented when it was made (not re-derived from the binary). AOT=1 additionally compiles
+# device code for the B70 (bmg-g31).
+GDNC_ARC_FLAGS="-DGDNC_PF=1 -DGDNC_PF_DIST=2 -DGDNC_PF_QK256=1 -DGDNC_CONV2=1 -DGDNC_VNNI2D=1 -DGDNC_PLANPAR=1 -DGDNC_CONV_VEC=4"
+build_gdnchunk() {
+  source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+  torch_flags
+  local targets=spir64; local aot=()
+  if [ "${AOT:-0}" = 1 ]; then targets=spir64_gen; aot=(-Xs "-device bmg-g31"); fi
+  icpx -fsycl -fsycl-targets=$targets "${aot[@]}" -O3 -ffast-math -fPIC -std=c++17 -shared \
+    -fsycl-device-code-split=per_kernel -D_GLIBCXX_USE_CXX11_ABI=1 ${GDNC_FLAGS:-$GDNC_ARC_FLAGS} \
+    -I gdnchunk/csrc $TORCH_INC -x c++ gdnchunk/csrc/gdn_chunk_ops.sycl -x none -o ${GDNC_OUT:-exl3xpu/gdnchunk.so} \
+    $TORCH_LIB
+  ls -la ${GDNC_OUT:-exl3xpu/gdnchunk.so}
+}
+
 case "$WHAT" in
   c) build_c ;;
+  gdnchunk) build_gdnchunk ;;
   all) build_c
+       build_gdnchunk
        ;;
   *) echo "usage: $0 [c|gdnchunk|ng|all] (what this version has)" >&2; exit 2 ;;
 esac

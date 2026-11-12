@@ -750,6 +750,72 @@ def _rc_alloc(layer, dev):
                         torch.zeros(2, S, T1, HV, device=dev), torch.zeros(2, S, T1, HV, device=dev))
 
 
+# GDN-PORT (off unless EXL3_GDN_PORT=<gdnchunk .so>): the non-spec prefill rows of a step go to the
+# 16-row chunked GDN prefill port (gdnchunk/: deterministic, more accurate than _xpu_C.gdn_attention)
+# instead of _xpu_C.gdn_attention. In place (src == dst = the request's state slot), one exact checkpoint per request at
+# pos0 + len (vLLM's state semantics), no tail pool. Needs the gdnport gdn_attn.py (metadata field pos0). Falls back to
+# the production op for anything else (non-spec decode rows in no-spec steps, interleaved layout, missing pos0).
+_PORT = {"so": os.environ.get("EXL3_GDN_PORT", ""), "ok": None, "n": 0, "dt": {}}
+_PORT_TRACE = os.environ.get("EXL3_GDN_PORT_TRACE", "0") == "1"
+_PORT_TOKINDX = os.environ.get("EXL3_GDN_PORT_TOKINDX", "0") == "1"   # mixed steps: in-place rows via token_indx
+
+
+def _port_ready():
+    if _PORT["ok"] is None:
+        try:
+            torch.ops.load_library(_PORT["so"])
+            _PORT["ok"] = hasattr(torch.ops, "gdnchunk") and hasattr(torch.ops.gdnchunk, "prefill")
+            logger.info("exl3: GDN-PORT loaded %s (%s)", _PORT["so"], _PORT["ok"])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("exl3: GDN-PORT load failed (%s): production op stays", e)
+            _PORT["ok"] = False
+    return _PORT["ok"]
+
+
+def _port_usable(self, md):
+    return (_port_ready() and getattr(md, "pos0", None) is not None and md.has_initial_state is not None
+            and not self.gqa_interleaved_layout and self.activation in ("silu", "swish")
+            and int(md.num_prefills) > 0)
+
+
+def _port_prefill(self, md, out, z, q, b, nT, token_indx=None):
+    """q/b: the non-spec rows (contiguous, in non_spec_query_start_loc order); out/z: [nT, HV, V]."""
+    dev = out.device
+    B = int(md.num_prefills) + int(md.num_decodes)
+    i32 = torch.int32
+    cu = md.non_spec_query_start_loc[:B + 1].to(i32).contiguous()
+    idx = md.non_spec_state_indices_tensor[:B].to(i32).contiguous()
+    pos0 = md.pos0[:B].to(i32).contiguous()
+    src = torch.where(md.has_initial_state[:B], idx, torch.full_like(idx, -1)).contiguous()
+    ck_pos = (pos0 + (cu[1:] - cu[:-1])).contiguous()
+    ck_cu = torch.arange(B + 1, dtype=i32, device=dev)
+    ck_kind = torch.zeros(B, dtype=i32, device=dev)
+    w = self.conv1d.weight
+    key = id(self)
+    if key not in _PORT["dt"]:   # dtype-converted constants, once per layer
+        _PORT["dt"][key] = (w.view(w.size(0), w.size(2)).to(torch.float16).contiguous(),
+                            None if self.conv1d.bias is None else self.conv1d.bias.to(torch.float16).contiguous(),
+                            self.A_log.float().contiguous(), self.dt_bias.to(torch.float16).contiguous())
+    cw, cb, alog, dtb = _PORT["dt"][key]
+    if _PORT_TRACE and any(self.prefix.endswith(f"layers.{i}.linear_attn") for i in (0, 1, 2)):
+        _PORT["ck0"] = (["%.9e" % self.kv_cache[1][i].double().sum().item() for i in idx.tolist()],
+                        ["%.9e" % self.kv_cache[0][i, :3].double().sum().item() for i in idx.tolist()])
+    torch.ops.gdnchunk.prefill(out, z, q, b, cw, cb, alog, dtb, cu, token_indx, pos0, src, ck_cu, ck_pos, idx, ck_kind,
+                               self.kv_cache[1], self.kv_cache[0], None, None, nT,
+                               self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size)
+    if _PORT["n"] < 3:
+        _PORT["n"] += 1
+        logger.info("exl3: GDN-PORT prefill %s: %d rows, %d requests", self.prefix, nT, B)
+    if _PORT_TRACE and any(self.prefix.endswith(f"layers.{i}.linear_attn") for i in (0, 1, 2)):
+        # debug: per step and request, cuts + float64 checksums of inputs, initial state, output, final state
+        def _ck(t):
+            return "%.9e" % t.double().sum().item()
+        st_after = [_ck(self.kv_cache[1][i]) for i in idx.tolist()]
+        logger.info("exl3: GDN-PORT-TRACE %s pos0 %s len %s init %s | qkvz %s ba %s | ssm0 %s conv0 %s | out %s z %s ssm1 %s",
+                    self.prefix.split(".")[-2], pos0.tolist(), (cu[1:] - cu[:-1]).tolist(), md.has_initial_state[:B].tolist(),
+                    _ck(q), _ck(b), _PORT["ck0"][0], _PORT["ck0"][1], _ck(out), _ck(z), st_after)
+
+
 _RC_FUSED_IN = os.environ.get("EXL3_RC_FUSED_IN", "0") == "1"
 _RCF_N = [0, 0, 0]
 _RCF_FB = {False: 0, True: 0}   # unfused-fallback layer calls (eager, captured)
@@ -781,6 +847,11 @@ def _rc_dispatch(core_attn_out, z, qkvz, ba, layer_name):
     md_all = fc.attn_metadata
     md = md_all.get(self.prefix) if isinstance(md_all, dict) else None
     if md is None or int(getattr(md, "num_spec_decodes", 0) or 0) == 0 or "buf" not in GDN_RC:
+        if (_PORT["so"] and md is not None and int(getattr(md, "num_spec_decodes", 0) or 0) == 0
+                and int(md.num_decodes) == 0 and _port_usable(self, md)):
+            n = int(md.num_actual_tokens)
+            _port_prefill(self, md, core_attn_out[:n], z[:n], qkvz[:n], ba[:n], n)
+            return
         return xo._exl3_rc_orig_impl(core_attn_out, z, qkvz, ba, layer_name)
     H = self.num_k_heads // self.tp_size; HV = self.num_v_heads // self.tp_size; K = self.head_k_dim; V = self.head_v_dim
     KD, VD = H * K, HV * V; CONV = 2 * KD + VD
@@ -790,22 +861,34 @@ def _rc_dispatch(core_attn_out, z, qkvz, ba, layer_name):
     pure = int(md.num_prefills) == 0 and int(md.num_decodes) == 0
     if not pure:
         nsi = md.non_spec_token_indx
-        nq = qkvz.index_select(0, nsi); nb_ = ba.index_select(0, nsi)
-        nT = nq.size(0)
-        c2 = torch.zeros(nT, HV, V, dtype=core_attn_out.dtype, device=core_attn_out.device); z2 = torch.empty_like(c2)
-        torch.ops._xpu_C.gdn_attention(
-            c2, z2, nq, nb_, self.num_k_heads, self.num_v_heads, K, V, conv_state=conv_state, ssm_state=ssm_state,
-            conv_weights=conv_w, conv_bias=self.conv1d.bias, activation=self.activation, A_log=self.A_log,
-            dt_bias=self.dt_bias, num_prefills=int(md.num_prefills), num_decodes=int(md.num_decodes), num_spec_decodes=0,
-            has_initial_state=md.has_initial_state,
-            non_spec_query_start_loc=md.non_spec_query_start_loc.to(torch.int32).contiguous(),
-            non_spec_token_indx=torch.arange(nT, device=c2.device, dtype=torch.int32),
-            non_spec_state_indices_tensor=md.non_spec_state_indices_tensor.to(torch.int32).contiguous(),
-            spec_query_start_loc=None, spec_token_indx=None, spec_state_indices_tensor=None, num_accepted_tokens=None,
-            num_actual_tokens=nT, tp_size=self.tp_size, reorder_input=not self.gqa_interleaved_layout)
-        core_attn_out[:qkvz.size(0)].index_copy_(0, nsi, c2); z[:qkvz.size(0)].index_copy_(0, nsi, z2)
-        si = md.spec_token_indx
-        sq = qkvz.index_select(0, si); sb = ba.index_select(0, si)
+        if _PORT["so"] and _port_usable(self, md) and _PORT_TOKINDX:
+            # GDN-PORT-TOKINDX: the port reads the non-spec rows in place and writes out/z at their
+            # token rows (token_indx), no gather of qkvz/ba and no scatter of out/z (profile: ~6% of a mixed prefill)
+            Tt = qkvz.size(0)
+            _port_prefill(self, md, core_attn_out[:Tt], z[:Tt], qkvz, ba, int(nsi.numel()),
+                          token_indx=nsi.to(torch.int32).contiguous())
+            si = md.spec_token_indx
+            sq = qkvz.index_select(0, si); sb = ba.index_select(0, si)
+        else:
+          nq = qkvz.index_select(0, nsi); nb_ = ba.index_select(0, nsi)
+          nT = nq.size(0)
+          c2 = torch.zeros(nT, HV, V, dtype=core_attn_out.dtype, device=core_attn_out.device); z2 = torch.empty_like(c2)
+          if _PORT["so"] and _port_usable(self, md):
+            _port_prefill(self, md, c2, z2, nq, nb_, nT)
+          else:
+            torch.ops._xpu_C.gdn_attention(
+              c2, z2, nq, nb_, self.num_k_heads, self.num_v_heads, K, V, conv_state=conv_state, ssm_state=ssm_state,
+              conv_weights=conv_w, conv_bias=self.conv1d.bias, activation=self.activation, A_log=self.A_log,
+              dt_bias=self.dt_bias, num_prefills=int(md.num_prefills), num_decodes=int(md.num_decodes), num_spec_decodes=0,
+              has_initial_state=md.has_initial_state,
+              non_spec_query_start_loc=md.non_spec_query_start_loc.to(torch.int32).contiguous(),
+              non_spec_token_indx=torch.arange(nT, device=c2.device, dtype=torch.int32),
+              non_spec_state_indices_tensor=md.non_spec_state_indices_tensor.to(torch.int32).contiguous(),
+              spec_query_start_loc=None, spec_token_indx=None, spec_state_indices_tensor=None, num_accepted_tokens=None,
+              num_actual_tokens=nT, tp_size=self.tp_size, reorder_input=not self.gqa_interleaved_layout)
+          core_attn_out[:qkvz.size(0)].index_copy_(0, nsi, c2); z[:qkvz.size(0)].index_copy_(0, nsi, z2)
+          si = md.spec_token_indx
+          sq = qkvz.index_select(0, si); sb = ba.index_select(0, si)
     else:
         nact = int(md.num_actual_tokens)
         sq, sb = qkvz[:nact], ba[:nact]

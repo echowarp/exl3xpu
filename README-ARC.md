@@ -26,6 +26,7 @@ compute-runtime (NEO) 26.31 / IGC 2.40 / Level Zero 1.32. All libraries are JIT 
 | Library | Source | Flags | Provenance of the flags |
 |---|---|---|---|
 | `exl3xpu/_C.so` | `csrc/exl3_ops.sycl` (+ headers) | `scripts/build_ext.sh` line + `-DEXL3_ALL_CODEBOOKS -DEXL3_K5_UNROLL24=4 -DEXL3_K5_MB128 -DEXL3_FOLD -DEXL3_HADOUT_B=8 -DEXL3_DPAS40_SMALLGRF -DEXL3_DPAS40_NT=1 -DEXL3_I4_U4DPAS -DEXL3_I4_K2T -DEXL3_SPEC_EPIU` (+ `-DEXL3_DNNL` when oneDNN is present) | **Reconstructed**: the build log of the production binary records no flags; the list comes from the build scripts of that build round. Not verified by a rebuild + checksum comparison. |
+| `exl3xpu/gdnchunk.so` | `gdnchunk/csrc/gdn_chunk_ops.sycl` | `-O3 -ffast-math -fsycl-device-code-split=per_kernel -DGDNC_PF=1 -DGDNC_PF_DIST=2 -DGDNC_PF_QK256=1 -DGDNC_CONV2=1 -DGDNC_VNNI2D=1 -DGDNC_PLANPAR=1 -DGDNC_CONV_VEC=4` | Documented with the production build when it was made; the binary itself carries no record. Not verified by a rebuild. |
 
 Nothing here reproduces the production binaries byte for byte; rebuild and run the tests in `tests/` before relying
 on a build.
@@ -85,6 +86,9 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and o/z writes inside the recompute kernel |
 | `EXL3_RC_FUSED_DBG` | default (0) | debug: compare against the unfused kernel |
 | `EXL3_GDN_RPS` | 4 | state rows per sub-group in the recompute kernels |
+| `EXL3_GDN_PORT` | path of `gdnchunk.so` | GDN-PORT: non-spec prefill rows on the 16-row chunked GDN prefill (deterministic); vLLM patch: `gdn_attn.py` metadata `pos0` |
+| `EXL3_GDN_PORT_TOKINDX` | 1 | mixed steps: the port reads/writes the rows in place (no gather/scatter) |
+| `EXL3_GDN_PORT_TRACE` | default (0) | debug: per-step checksums in the log |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
@@ -118,4 +122,5 @@ Nothing derived from traffic ships with this fork. The production values above p
 | `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` | B70 split-K table for the decode linears |
 | `exl3xpu/draftdyn.py` | DRAFT-DYN row selection / batch assembly / sample fix-up (CPU-testable) |
 | `exl3xpu/draftgraph.py` | DS-SUB and DRAFT-GRAPH |
+| `gdnchunk/` | GDN chunked prefill port (Apache-2.0, derived from Magnitude; own `LICENSE` and `NOTICE`) |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |

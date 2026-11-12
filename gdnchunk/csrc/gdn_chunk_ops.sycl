@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: Apache-2.0
+// Torch op library for the GDN chunk prefill port (gdn_chunk_sycl.h; derived from Magnitude, see ../NOTICE).
+// Built like the fork's exl3_ops.sycl (icpx -fsycl spir64 JIT, ../build.sh); registers torch.ops.gdnchunk.*.
+// It could also be built into csrc/exl3_ops.sycl: #include "gdn_chunk_sycl.h" there and move the m.def/m.impl
+// lines into TORCH_LIBRARY(exl3xpu_C).
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include "gdn_chunk_sycl.h"
+
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+template <class T> static T* opt_ptr(const c10::optional<at::Tensor>& t) {
+    return t.has_value() && t->defined() ? reinterpret_cast<T*>(t->data_ptr()) : nullptr;
+}
+static void check_i32(const at::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_xpu() && t.scalar_type() == at::kInt && t.is_contiguous() && t.dim() == 1, name, ": contiguous int32 1-D on XPU");
+}
+static void check_align(const at::Tensor& t, int bytes, const char* name) {
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0, name, ": not ", bytes, "-byte aligned");
+}
+
+// Upper bound on the pieces of a launch without a device sync (same bound as the CUDA port in exl3cuda).
+static int64_t max_pieces(int64_t M, int64_t B, int64_t n_ck) { return (M + 2 * gdnc::TAIL * B) / gdnc::PIECE + 3 * B + n_ck + 1; }
+
+int64_t gdnchunk_scratch_bytes(int64_t M, int64_t B, int64_t n_ck, int64_t num_k_heads, int64_t num_v_heads) {
+    const int64_t CH = (2 * num_k_heads + num_v_heads) * gdnc::W, RAW = CH + 2 * num_v_heads;
+    return max_pieces(M, B, n_ck) * (num_k_heads * gdnc::QK_BLOCK + num_v_heads * gdnc::REC) * 2 +
+           n_ck * ((gdnc::CONVW - 1) * CH + gdnc::TAIL * RAW) * 2;
+}
+
+// Contract (same as the CUDA port's forward() in exl3cuda, Arc input layout):
+//   out [tokens, HV, V] f16, z like out; qkvz [tokens, CH + HV*V] f16 (q|k|v|z), ba [tokens, 2 HV] f16 (b|a);
+//   conv_w [CH, 4] f16, conv_b [CH] f16 or None, A_log [HV] f32, dt_bias [HV] f16;
+//   cu [B+1] packed rows per slot; token_indx [rows] packed row -> token row, or None (identity);
+//   pos0 [B] absolute position of each slot's first new row; src [B] state slot to resume from (-1: zero state/window);
+//   ck_cu [B+1], ck_pos [n] (absolute, pos0 <= pos <= pos0 + rows), ck_dst [n], ck_kind [n] (0 exact, 1 aligned + tail);
+//   ssm_state [S, HV, V, K] f32; conv_state [S, >=3, CH] f16 (rows 0..2 = window); tail [S, 15, CH + 2 HV] f16 or None
+//   (None: every checkpoint is treated as exact, no tails read or written); tail_count [S] int32 or None.
+// Nothing is published implicitly: pass an exact checkpoint at pos0 + rows into the slot to get vLLM's final state.
+// Returns [slot_start, piece_cu, pieces, sqk, srec] (scratch, for the harness's stage checks).
+std::vector<at::Tensor> gdnchunk_prefill(at::Tensor out, at::Tensor z, at::Tensor qkvz, at::Tensor ba,
+        at::Tensor conv_w, c10::optional<at::Tensor> conv_b, at::Tensor A_log, at::Tensor dt_bias,
+        at::Tensor cu, c10::optional<at::Tensor> token_indx, at::Tensor pos0, at::Tensor src,
+        at::Tensor ck_cu, at::Tensor ck_pos, at::Tensor ck_dst, at::Tensor ck_kind,
+        at::Tensor ssm_state, at::Tensor conv_state, c10::optional<at::Tensor> tail, c10::optional<at::Tensor> tail_count,
+        int64_t num_tokens, int64_t num_k_heads, int64_t num_v_heads) {
+    using namespace gdnc;
+    const int NK = num_k_heads, NV = num_v_heads, B = cu.numel() - 1, M = num_tokens;
+    TORCH_CHECK(NK > 0 && NV % NK == 0 && NV / NK >= 1 && NV / NK <= 4, "NV / NK in 1..4");
+    const int GROUP = NV / NK, CH = (2 * NK + NV) * W, RAW = CH + 2 * NV;
+    TORCH_CHECK(qkvz.is_xpu() && qkvz.scalar_type() == at::kHalf && qkvz.dim() == 2 && qkvz.size(1) >= CH + NV * W && qkvz.stride(1) == 1 && qkvz.stride(0) % 2 == 0, "qkvz: f16 [T, CH + HV*V] (reorder layout)");
+    TORCH_CHECK(ba.scalar_type() == at::kHalf && ba.dim() == 2 && ba.size(1) == 2 * NV && ba.stride(1) == 1, "ba: f16 [T, 2 HV]");
+    TORCH_CHECK(out.scalar_type() == at::kHalf && out.is_contiguous() && out.dim() == 3 && out.size(1) == NV && out.size(2) == W, "out: f16 [T, HV, 128]");
+    TORCH_CHECK(z.scalar_type() == at::kHalf && z.is_contiguous() && z.sizes() == out.sizes(), "z like out");
+    TORCH_CHECK(conv_w.scalar_type() == at::kHalf && conv_w.is_contiguous() && conv_w.numel() == (int64_t)CH * CONVW, "conv_w: f16 [CH, 4]");
+    TORCH_CHECK(!conv_b.has_value() || (conv_b->scalar_type() == at::kHalf && conv_b->numel() == CH && conv_b->is_contiguous()), "conv_b f16 [CH]");
+    TORCH_CHECK(A_log.scalar_type() == at::kFloat && A_log.numel() == NV && dt_bias.scalar_type() == at::kHalf && dt_bias.numel() == NV, "A_log f32, dt_bias f16");
+    check_i32(cu, "cu"); check_i32(pos0, "pos0"); check_i32(src, "src");
+    check_i32(ck_cu, "ck_cu"); check_i32(ck_pos, "ck_pos"); check_i32(ck_dst, "ck_dst"); check_i32(ck_kind, "ck_kind");
+    TORCH_CHECK(pos0.numel() == B && src.numel() == B && ck_cu.numel() == B + 1, "slot tensors");
+    const int n_ck = ck_pos.numel();
+    TORCH_CHECK(ck_dst.numel() == n_ck && ck_kind.numel() == n_ck, "checkpoint tensors");
+    if (token_indx.has_value()) check_i32(*token_indx, "token_indx");
+    TORCH_CHECK(ssm_state.scalar_type() == at::kFloat && ssm_state.dim() == 4 && ssm_state.size(1) == NV && ssm_state.size(2) == W &&
+                ssm_state.size(3) == W && ssm_state.stride(3) == 1 && ssm_state.stride(2) == W && ssm_state.stride(1) == W * W &&
+                ssm_state.stride(0) % 16 == 0, "ssm_state: f32 [S, HV, 128, 128], each slot contiguous, 64-byte slot stride");
+    TORCH_CHECK(conv_state.scalar_type() == at::kHalf && conv_state.dim() == 3 && conv_state.size(1) >= CONVW - 1 &&
+                conv_state.size(2) == CH && conv_state.stride(2) == 1 && conv_state.stride(1) == CH, "conv_state: f16 [S, >=3, CH], rows contiguous");
+    if (tail.has_value()) {
+        TORCH_CHECK(tail->scalar_type() == at::kHalf && tail->dim() == 3 && tail->size(1) == TAIL && tail->size(2) == RAW && tail->is_contiguous(), "tail [S, 15, CH + 2 HV] f16 contiguous");
+        TORCH_CHECK(tail_count.has_value() && tail_count->numel() == ssm_state.size(0), "tail needs tail_count [S]");
+    }
+    if (tail_count.has_value()) check_i32(*tail_count, "tail_count");
+    check_align(ssm_state, 64, "ssm_state"); check_align(out, 16, "out");
+
+    const int64_t P = max_pieces(M, B, n_ck);
+    auto oi = cu.options();
+    at::Tensor slot_start = at::empty({B}, oi), piece_cu = at::empty({B + 1}, oi), pieces = at::empty({P, PD}, oi);
+    at::Tensor sqk = at::empty({P * NK * QK_BLOCK}, qkvz.options()), srec = at::empty({P * NV * REC}, qkvz.options());
+    if (B <= 0) return {slot_start, piece_cu, pieces, sqk, srec};
+
+    Params p{};
+    p.qkvz = reinterpret_cast<const half*>(qkvz.data_ptr()); p.qkvz_stride = qkvz.stride(0);
+    p.ba = reinterpret_cast<const half*>(ba.data_ptr()); p.ba_stride = ba.stride(0);
+    p.token_indx = opt_ptr<const int>(token_indx);
+    p.convw = reinterpret_cast<const half*>(conv_w.data_ptr()); p.convb = opt_ptr<const half>(conv_b);
+    p.A_log = A_log.data_ptr<float>(); p.dt_bias = reinterpret_cast<const half*>(dt_bias.data_ptr());
+    p.cu = cu.data_ptr<int>(); p.pos0 = pos0.data_ptr<int>(); p.src = src.data_ptr<int>();
+    p.ck_cu = ck_cu.data_ptr<int>(); p.ck_pos = ck_pos.data_ptr<int>(); p.ck_dst = ck_dst.data_ptr<int>(); p.ck_kind = ck_kind.data_ptr<int>();
+    p.state = ssm_state.data_ptr<float>(); p.st_slot = ssm_state.stride(0);
+    p.window = reinterpret_cast<half*>(conv_state.data_ptr()); p.win_slot = conv_state.stride(0);
+    p.tail = opt_ptr<half>(tail); p.tail_slot = tail.has_value() ? tail->stride(0) : 0;
+    p.tail_count = opt_ptr<int>(tail_count);
+    p.out = reinterpret_cast<half*>(out.data_ptr());
+    p.slot_start = slot_start.data_ptr<int>(); p.piece_cu = piece_cu.data_ptr<int>(); p.pieces = pieces.data_ptr<int>();
+    p.sqk = reinterpret_cast<half*>(sqk.data_ptr()); p.srec = reinterpret_cast<half*>(srec.data_ptr());
+    p.B = B; p.NK = NK; p.NV = NV; p.CH = CH; p.RAW = RAW; p.max_pieces = P; p.eps = 1e-6f;
+
+    auto& q = queue_of(qkvz);
+#if GDNC_ZFUSE
+    p.zout = M > 0 ? reinterpret_cast<half*>(z.data_ptr()) : nullptr;
+#endif
+    q.submit([&](sycl::handler& h) { h.single_task(GdnPlan{p}); });
+#if GDNC_PLANPAR
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<1>((size_t)P), GdnPlanFill{p}); });
+#endif
+    auto prep = [&](auto tag) {
+        constexpr int G = decltype(tag)::value;
+        using K = GdnPrepare<G>;
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> slm(sycl::range<1>(K::SLM_FLOATS), h);
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(P, (size_t)NK * PREP_WG), sycl::range<2>(1, PREP_WG)), K{p, slm});
+        });
+    };
+    if (GROUP == 1) prep(std::integral_constant<int, 1>{});
+    else if (GROUP == 2) prep(std::integral_constant<int, 2>{});
+    else if (GROUP == 3) prep(std::integral_constant<int, 3>{});
+    else prep(std::integral_constant<int, 4>{});
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)B * NV * SCAN_SPLIT * SCAN_WG, SCAN_WG), GdnScan{p}); });
+    if (n_ck > 0) {
+        at::Tensor tmp = at::empty({(int64_t)n_ck * ((CONVW - 1) * CH + TAIL * RAW)}, qkvz.options());
+        half* tp = reinterpret_cast<half*>(tmp.data_ptr());
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(n_ck, RAW), GdnPubGather{p, tp}); });
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(n_ck, RAW), GdnPubScatter{p, tp}); });
+    }
+    if (M > 0 && !GDNC_ZFUSE) {
+        GdnZCopy zc{reinterpret_cast<const uint32_t*>(qkvz.data_ptr()), reinterpret_cast<uint32_t*>(z.data_ptr()), p.token_indx,
+                    qkvz.stride(0) / 2, CH / 2, NV * W / 2};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<1>((size_t)M * (NV * W / 2)), zc); });
+    }
+    return {slot_start, piece_cu, pieces, sqk, srec};
+}
+
+TORCH_LIBRARY(gdnchunk, m) {
+    m.def("prefill(Tensor(a!) out, Tensor(b!) z, Tensor qkvz, Tensor ba, Tensor conv_w, Tensor? conv_b, Tensor A_log, "
+          "Tensor dt_bias, Tensor cu, Tensor? token_indx, Tensor pos0, Tensor src, Tensor ck_cu, Tensor ck_pos, "
+          "Tensor ck_dst, Tensor ck_kind, Tensor(c!) ssm_state, Tensor(d!) conv_state, Tensor(e!)? tail, "
+          "Tensor(f!)? tail_count, int num_tokens, int num_k_heads, int num_v_heads) -> Tensor[]");
+    m.impl("prefill", torch::kXPU, &gdnchunk_prefill);
+    m.def("scratch_bytes(int M, int B, int n_ck, int num_k_heads, int num_v_heads) -> int", &gdnchunk_scratch_bytes);
+}
