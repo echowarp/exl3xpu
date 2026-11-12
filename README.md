@@ -1,5 +1,8 @@
 # exl3xpu
 
+> **Arc Pro B70 production fork:** this branch adds the kernels and plugin features of a Qwen3.8-27B
+> production deployment; see [README-ARC.md](README-ARC.md).
+
 ![Qwen3.8-27B EXL3 on one Intel Arc Pro B70](docs/banner/banner.png)
 
 EXL3 ([exllamav3](https://github.com/turboderp-org/exllamav3) trellis quantization) inference on Intel Arc
