@@ -678,6 +678,223 @@ def _patch_fast_norm():
     logger.info("exl3: fast fused add+RMSNorm enabled (decode batches)")
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# GDN-RECOMPUTE: speculative decoding for the GDN layers with one
+# committed SSM state slot per request + the previous step's accepted tokens applied lazily (exl3_gdn_recompute),
+# so MambaSpec.num_speculative_blocks = 0. EXL3_GDN_RECOMPUTE=1 enables.
+GDN_RC = {"on": os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1", "S": int(os.environ.get("EXL3_GDN_RC_SLOTS", "16"))}
+
+
+def _patch_gdn_recompute():
+    if not GDN_RC["on"]:
+        return
+    import dataclasses
+    try:
+        from vllm.model_executor.layers.mamba import abstract as mabs
+        from vllm.v1.kv_cache_interface import MambaSpec
+        from vllm.model_executor.layers.mamba import mamba_utils as mmu
+        from vllm.v1.worker import mamba_utils as wmu
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as qg
+    except Exception as e:  # noqa
+        logger.warning("exl3: GDN recompute not installed (%s)", e)
+        return
+    if getattr(mabs.MambaBase, "_exl3_rc", False):
+        return
+    # 1. no speculative state blocks
+    orig_spec = mabs.MambaBase.get_kv_cache_spec
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = orig_spec(self, vllm_config)
+        if isinstance(spec, MambaSpec) and spec.num_speculative_blocks:
+            GDN_RC["T1"] = spec.num_speculative_blocks + 1
+            spec = dataclasses.replace(spec, num_speculative_blocks=0)
+        return spec
+    mabs.MambaBase.get_kv_cache_spec = get_kv_cache_spec
+    mabs.MambaBase._exl3_rc = True
+
+    # 2. block-crossing SSM copy takes the committed state (no accept bias); same function object (identity checks)
+    def _temporal(state, block_ids, cur_block_idx, num_accepted_tokens):
+        src_state = state[block_ids[cur_block_idx]]
+        return MambaCopySpec(start_addr=src_state.data_ptr(), num_elements=src_state.numel())
+    mmu.get_temporal_copy_spec.__code__ = _temporal.__code__
+
+    # 3. fused postprocess: no SSM copies (the kernel stores decode-time boundary states itself)
+    orig_init = wmu.MambaSpecDecodeGPUContext.initialize_from_forward_context
+
+    def initialize_from_forward_context(self, *a, **kw):
+        was = self.is_initialized
+        orig_init(self, *a, **kw)
+        if not was:
+            self.state_inner_sizes.masked_fill_(self.state_conv_widths == 0, 0)
+            logger.info("exl3: GDN recompute: postprocess SSM copies disabled")
+    wmu.MambaSpecDecodeGPUContext.initialize_from_forward_context = initialize_from_forward_context
+
+    # 4. GDN core: route inside the opaque custom op (torch.compile freezes Python branches in forward_xpu at trace
+    #    time): swap the op implementation's code for a dispatcher (same function object -> registration intact).
+    import types
+    from vllm import _xpu_ops as xo
+    impl = xo._gdn_attention_core_xpu_impl
+    xo._exl3_rc_orig_impl = types.FunctionType(impl.__code__, impl.__globals__, "_orig", impl.__defaults__, impl.__closure__)
+    xo._exl3_rc_dispatch = _rc_dispatch
+
+    def _wrapper(core_attn_out, z, projected_states_qkvz, projected_states_ba, layer_name):
+        return _exl3_rc_dispatch(core_attn_out, z, projected_states_qkvz, projected_states_ba, layer_name)
+    impl.__code__ = _wrapper.__code__
+    logger.info("exl3: GDN recompute enabled (num_speculative_blocks = 0, %d pending slots)", GDN_RC["S"])
+
+
+def _rc_alloc(layer, dev):
+    T1 = GDN_RC.get("T1", 6); S = GDN_RC["S"]
+    H = layer.num_k_heads // layer.tp_size; HV = layer.num_v_heads // layer.tp_size; K = layer.head_k_dim; V = layer.head_v_dim
+    layer._exl3_pool = (torch.zeros(2, S, T1, H, K, device=dev), torch.zeros(2, S, T1, HV, V, device=dev),
+                        torch.zeros(2, S, T1, HV, device=dev), torch.zeros(2, S, T1, HV, device=dev))
+
+
+_RC_FUSED_IN = os.environ.get("EXL3_RC_FUSED_IN", "0") == "1"
+_RCF_N = [0, 0, 0]
+_RCF_FB = {False: 0, True: 0}   # unfused-fallback layer calls (eager, captured)
+_RCF_DBG = os.environ.get("EXL3_RC_FUSED_DBG", "0") == "1"
+
+
+def _capturing_rc():
+    f = getattr(torch.xpu, "is_current_stream_capturing", None)
+    return bool(f and f())
+
+
+def _rcf_ok(x, sb, sq, out, z):
+    E = getattr(torch.ops, "exl3xpu_C", None)
+    return (E is not None and hasattr(E, "exl3_gdn_recompute_fused") and x.dtype == torch.float16
+            and sb.dtype == torch.float16 and x.stride(-1) == 1 and sb.stride(-1) == 1 and sq.stride(-1) == 1
+            and out.dim() == 3 and out.stride(-1) == 1 and out.stride(-2) == out.size(-1)
+            and z.dim() == 3 and z.stride(-1) == 1 and z.stride(-2) == z.size(-1))
+
+
+def _rc_dispatch(core_attn_out, z, qkvz, ba, layer_name):
+    import torch.nn.functional as F
+    from vllm.forward_context import get_forward_context
+    from vllm import _xpu_ops as xo
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+    fc = get_forward_context()
+    self = fc.no_compile_layers[layer_name]
+    if not hasattr(self, "_exl3_pool"):
+        _rc_alloc(self, core_attn_out.device)
+    md_all = fc.attn_metadata
+    md = md_all.get(self.prefix) if isinstance(md_all, dict) else None
+    if md is None or int(getattr(md, "num_spec_decodes", 0) or 0) == 0 or "buf" not in GDN_RC:
+        return xo._exl3_rc_orig_impl(core_attn_out, z, qkvz, ba, layer_name)
+    H = self.num_k_heads // self.tp_size; HV = self.num_v_heads // self.tp_size; K = self.head_k_dim; V = self.head_v_dim
+    KD, VD = H * K, HV * V; CONV = 2 * KD + VD
+    ns = int(md.num_spec_decodes)
+    conv_state, ssm_state = self.kv_cache[0], self.kv_cache[1]
+    conv_w = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+    pure = int(md.num_prefills) == 0 and int(md.num_decodes) == 0
+    if not pure:
+        nsi = md.non_spec_token_indx
+        nq = qkvz.index_select(0, nsi); nb_ = ba.index_select(0, nsi)
+        nT = nq.size(0)
+        c2 = torch.zeros(nT, HV, V, dtype=core_attn_out.dtype, device=core_attn_out.device); z2 = torch.empty_like(c2)
+        torch.ops._xpu_C.gdn_attention(
+            c2, z2, nq, nb_, self.num_k_heads, self.num_v_heads, K, V, conv_state=conv_state, ssm_state=ssm_state,
+            conv_weights=conv_w, conv_bias=self.conv1d.bias, activation=self.activation, A_log=self.A_log,
+            dt_bias=self.dt_bias, num_prefills=int(md.num_prefills), num_decodes=int(md.num_decodes), num_spec_decodes=0,
+            has_initial_state=md.has_initial_state,
+            non_spec_query_start_loc=md.non_spec_query_start_loc.to(torch.int32).contiguous(),
+            non_spec_token_indx=torch.arange(nT, device=c2.device, dtype=torch.int32),
+            non_spec_state_indices_tensor=md.non_spec_state_indices_tensor.to(torch.int32).contiguous(),
+            spec_query_start_loc=None, spec_token_indx=None, spec_state_indices_tensor=None, num_accepted_tokens=None,
+            num_actual_tokens=nT, tp_size=self.tp_size, reorder_input=not self.gqa_interleaved_layout)
+        core_attn_out[:qkvz.size(0)].index_copy_(0, nsi, c2); z[:qkvz.size(0)].index_copy_(0, nsi, z2)
+        si = md.spec_token_indx
+        sq = qkvz.index_select(0, si); sb = ba.index_select(0, si)
+    else:
+        nact = int(md.num_actual_tokens)
+        sq, sb = qkvz[:nact], ba[:nact]
+    T = sq.size(0)
+    T1 = GDN_RC.get("T1", 6)
+    sidx = md.spec_state_indices_tensor[:ns, 0].to(torch.int32).contiguous()
+    qsl = md.spec_query_start_loc[:ns + 1].to(torch.int32).contiguous()
+    x = causal_conv1d_update(sq[:, :CONV], conv_state.transpose(-1, -2), conv_w, self.conv1d.bias, self.activation,
+                             conv_state_indices=sidx, num_accepted_tokens=md.num_accepted_tokens[:ns],
+                             query_start_loc=md.spec_query_start_loc[:ns + 1], max_query_len=T1, validate_data=False)
+    st = GDN_RC["buf"]
+    gi = GDN_RC["layer_group"].get(self.prefix, 0)
+    if _RC_FUSED_IN and _RCF_N[0] < 4 and not pure:
+        _RCF_N[0] += 1
+        logger.info("exl3: RC-FUSED-IN mixed step check: ok=%s x %s/%s sb %s sq %s out %s/%s z %s/%s", _rcf_ok(x, sb, sq, core_attn_out, z),
+                    tuple(x.shape), x.stride(), sb.stride(), sq.stride(), tuple(core_attn_out.shape), core_attn_out.stride(),
+                    tuple(z.shape), z.stride())
+    if _RC_FUSED_IN and _rcf_ok(x, sb, sq, core_attn_out, z):
+        # RC-FUSED-IN (as EXL3_RC_FUSED_IN of the CUDA port): q/k/v split, g/beta and the o/z
+        # writes (at the spec rows in mixed steps) inside the recompute kernel: ~15 fewer launches per GDN layer
+        # the live parameters every call (fp32 A_log / fp16 dt_bias are used as is, no copy): a converted copy cached at
+        # the first call held pre-load values (the first call runs before the weights are in place)
+        alog_f = self.A_log if self.A_log.dtype == torch.float32 and self.A_log.is_contiguous() else self.A_log.float().contiguous()
+        dtb_h = self.dt_bias if self.dt_bias.dtype == torch.float16 and self.dt_bias.is_contiguous() else self.dt_bias.half().contiguous()
+        if not _RCF_N[2] and self.prefix.endswith("layers.0.linear_attn"):
+            _RCF_N[2] = 1
+            logger.info("exl3: RC-FUSED-IN active")
+        oidx = None if pure else si.to(torch.int32)
+        dbg = None
+        if _RCF_DBG and not pure and _RCF_N[1] < 12 and not _capturing_rc():
+            # debug check: the unfused path on cloned state rows / pending pool, compared after the fused call
+            _RCF_N[1] += 1
+            Tq = x.size(0)
+            q_ = x[:, :KD].reshape(Tq, H, K).contiguous(); k_ = x[:, KD:2 * KD].reshape(Tq, H, K).contiguous()
+            v_ = x[:, 2 * KD:].reshape(Tq, HV, V).contiguous()
+            g_ = (-torch.exp(self.A_log.float()) * F.softplus(sb[:, HV:2 * HV].float() + self.dt_bias.float())).contiguous()
+            b_ = torch.sigmoid(sb[:, :HV].float()).contiguous()
+            o_ = torch.empty(Tq, HV, V, dtype=core_attn_out.dtype, device=x.device)
+            hs = ssm_state.index_select(0, sidx.long()).clone()
+            pool_ = [t.clone() for t in self._exl3_pool]
+            torch.ops.exl3xpu_C.exl3_gdn_recompute(q_, k_, v_, g_, b_, o_, hs, torch.arange(ns, device=x.device, dtype=torch.int32),
+                                                   *pool_, st["npend"][:ns], st["slot"][:ns], st["par"][:ns], qsl, T1, K ** -0.5,
+                                                   None, None)
+            dbg = (o_, hs, pool_, sq[:, CONV:].reshape(Tq, HV, V).clone())
+            if _RCF_N[1] <= 2:
+                logger.info("exl3: RC-FUSED-DBG inputs A_log %s %s %s dt_bias %s %s %s rcf %s %s | g_[0,:4] %s a[0,:4] %s alog[:4] %s dtb[:4] %s",
+                            self.A_log.dtype, tuple(self.A_log.shape), self.A_log.stride(), self.dt_bias.dtype,
+                            tuple(self.dt_bias.shape), self.dt_bias.stride(), tuple(alog_f.shape),
+                            tuple(dtb_h.shape), g_[0, :4].tolist(), sb[0, HV:HV + 4].tolist(),
+                            alog_f[:4].tolist(), dtb_h[:4].tolist())
+        torch.ops.exl3xpu_C.exl3_gdn_recompute_fused(x, sb, alog_f, dtb_h, core_attn_out, z,
+                                                     sq[:, CONV:], oidx, H, ssm_state, sidx, *self._exl3_pool,
+                                                     st["npend"][:ns], st["slot"][:ns], st["par"][:ns], qsl, T1, K ** -0.5,
+                                                     st["bidx"][:ns], st["bblk"][gi, :ns])
+        if dbg is not None:
+            o_, hs, pool_, z_ = dbg
+            d = lambda u, w: (u.float() - w.float()).abs().max().item()
+            wb = int(1 - st["par"][0].item()) ; sl = int(st["slot"][0].item())
+            logger.info("exl3: RC-FUSED-DBG pg fused[:4] %s unfused[:4] %s", self._exl3_pool[2][wb, sl, 0, :4].tolist(),
+                        pool_[2][wb, sl, 0, :4].tolist())
+            logger.info("exl3: RC-FUSED-DBG %s T=%d ns=%d: o %.2e z %.2e state %.2e pk %.2e pv %.2e pg %.2e pb %.2e",
+                        self.prefix.split(".")[-2], x.size(0), ns, d(o_, core_attn_out.index_select(0, si)),
+                        d(z_, z.index_select(0, si)), d(hs, ssm_state.index_select(0, sidx.long())),
+                        *[d(u, w) for u, w in zip(pool_, self._exl3_pool)])
+        return
+    if _RC_FUSED_IN:   # graph audit: which steps miss the fused path (count all; log the first 3 eager + 3 captured)
+        _cap = _capturing_rc(); _RCF_FB[_cap] += 1
+        if _RCF_FB[_cap] <= 3 * 48 and _RCF_FB[_cap] % 48 == 1:
+          logger.info("exl3: RC-FUSED-IN fallback (unfused recompute) #%d capturing=%s: pure=%s ns=%d x %s/%s %s sb %s/%s sq %s out %s/%s z %s/%s",
+                    _RCF_FB[_cap], _cap, pure, ns, tuple(x.shape), x.stride(), x.dtype, tuple(sb.shape), sb.stride(), sq.stride(),
+                    tuple(core_attn_out.shape), core_attn_out.stride(), tuple(z.shape), z.stride())
+    q = x[:, :KD].reshape(T, H, K).contiguous(); k = x[:, KD:2 * KD].reshape(T, H, K).contiguous()
+    v = x[:, 2 * KD:].reshape(T, HV, V).contiguous()
+    b, a = sb[:, :HV].float(), sb[:, HV:2 * HV].float()
+    g = (-torch.exp(self.A_log.float()) * F.softplus(a + self.dt_bias.float())).contiguous()
+    beta = torch.sigmoid(b).contiguous()
+    o = torch.empty(T, HV, V, dtype=core_attn_out.dtype, device=core_attn_out.device)
+    st = GDN_RC["buf"]
+    gi = GDN_RC["layer_group"].get(self.prefix, 0)
+    torch.ops.exl3xpu_C.exl3_gdn_recompute(q, k, v, g, beta, o, ssm_state, sidx, *self._exl3_pool,
+                                           st["npend"][:ns], st["slot"][:ns], st["par"][:ns], qsl, T1, K ** -0.5,
+                                           st["bidx"][:ns], st["bblk"][gi, :ns])
+    zs = sq[:, CONV:].reshape(T, HV, V)
+    if pure:
+        core_attn_out[:T].copy_(o); z[:T].copy_(zs)
+    else:
+        core_attn_out.index_copy_(0, si, o); z.index_copy_(0, si, zs)
+
+
 # ---- int8_per_token_head KV cache at fp16-or-better speed (vLLM's Triton backend layout and
 # write path; attention compute replaced). Uniform decode / spec-verify batches (q_len <= 8, incl. the MTP drafter's
 # q_len 1) -> exl3_spec_attn int8 kernel (int8 Q.K and P.V on XMX, per-token scales inline in the cache rows).
@@ -1098,6 +1315,7 @@ def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     _patch_fused_mlp()
     _patch_fast_norm()
+    _patch_gdn_recompute()
     _patch_int8kv_fast()
     if os.environ.get("EXL3_DS_SUB", "0") == "1" or os.environ.get("EXL3_DRAFT_GRAPH", "0") == "1":
         from . import draftgraph   # DS-SUB / DRAFT-GRAPH (before the graded-vocab propose wrapper)

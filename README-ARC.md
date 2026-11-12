@@ -80,6 +80,11 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_DRAFT_DYN` | 256 | DRAFT-DYN: up to N extra far-head rows per request (its most frequent prompt tokens outside the static head; int4 rows gathered from a host copy of lm_head) |
 | `EXL3_DRAFT_DYN_NEAR` | 128 | the same for the near head |
 | `EXL3_DRAFT_BIAS` | 0 | drafter logit bias on prompt tokens (0 = off) |
+| `EXL3_GDN_RECOMPUTE` | 1 | GDN recompute: MTP spec decoding with one committed SSM state per request (num_speculative_blocks = 0); vLLM patch: gpu_model_runner GDN-RC hooks |
+| `EXL3_GDN_RC_SLOTS` | default (16) | pending-pool slots |
+| `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and o/z writes inside the recompute kernel |
+| `EXL3_RC_FUSED_DBG` | default (0) | debug: compare against the unfused kernel |
+| `EXL3_GDN_RPS` | 4 | state rows per sub-group in the recompute kernels |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule

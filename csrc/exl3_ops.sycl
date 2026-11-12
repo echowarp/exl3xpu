@@ -11,6 +11,7 @@
 #include "draft_sample_sycl.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "norm_sycl.h"
+#include "gdn_recompute_sycl.h"
 static int g_norm_wg = 128;
 static int exl3_norm_wg() { return g_norm_wg; }
 static void exl3_set_norm_wg(int64_t n) { g_norm_wg = (int)n; }
@@ -1330,6 +1331,44 @@ void exl3_stream_probe(at::Tensor trellis, at::Tensor out, int64_t M) {
     q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), k); });
 }
 
+// ---- GDN spec decode with one committed state slot (recompute pending tokens), see gdn_recompute_sycl.h
+void exl3_gdn_recompute(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor g, at::Tensor beta, at::Tensor o,
+                        at::Tensor h, at::Tensor state_idx, at::Tensor pk, at::Tensor pv, at::Tensor pg, at::Tensor pb,
+                        at::Tensor n_pend, at::Tensor slot, at::Tensor par, at::Tensor qsl, int64_t T1, double scale,
+                        c10::optional<at::Tensor> bnd_idx, c10::optional<at::Tensor> bnd_block) {
+    // pk [2, S, T1, H, K], pv [2, S, T1, HV, V], pg/pb [2, S, T1, HV] fp32; per request: state_idx, n_pend, slot, par
+    // (int32 [N]), qsl (int32 [N+1]) token starts of this step's tokens in q/k/v (contiguous, <= T1 per request).
+    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf && o.scalar_type() == at::kHalf);
+    TORCH_CHECK(g.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat && h.scalar_type() == at::kFloat);
+    TORCH_CHECK(pk.scalar_type() == at::kFloat && pk.dim() == 5 && pk.size(2) == T1);
+    int N = state_idx.numel(), H = q.size(-2), Kd = q.size(-1), HV = v.size(-2), V = v.size(-1), S = pk.size(1);
+    TORCH_CHECK(Kd == exl3gdn::KD && h.size(-1) == Kd && h.size(-2) == V && h.dim() == 4 && h.stride(3) == 1);
+    if (N == 0) return;
+    auto& qu = queue_of(q);
+    static int rps = []{ const char* e = std::getenv("EXL3_GDN_RPS"); return e ? std::atoi(e) : 4; }();
+    TORCH_CHECK(T1 <= exl3gdn::NSG && T1 <= exl3gdn::TMAX);
+    auto launch = [&](auto tag) {
+        constexpr int R = decltype(tag)::value;
+        TORCH_CHECK(V % (exl3gdn::NSG * R) == 0);
+        size_t wgs = (size_t)N * HV * (V / (exl3gdn::NSG * R)), L = exl3gdn::NSG * exl3gdn::SG;
+        qu.submit([&](sycl::handler& hd) {
+            sycl::local_accessor<float, 1> slm(sycl::range<1>(3 * exl3gdn::TMAX * exl3gdn::KD), hd);
+            exl3gdn::Recompute<R> kr{reinterpret_cast<const sycl::half*>(q.data_ptr<at::Half>()), reinterpret_cast<const sycl::half*>(k.data_ptr<at::Half>()),
+                              reinterpret_cast<const sycl::half*>(v.data_ptr<at::Half>()), g.data_ptr<float>(), beta.data_ptr<float>(),
+                              reinterpret_cast<sycl::half*>(o.data_ptr<at::Half>()), h.data_ptr<float>(), state_idx.data_ptr<int>(),
+                              pk.data_ptr<float>(), pv.data_ptr<float>(), pg.data_ptr<float>(), pb.data_ptr<float>(), n_pend.data_ptr<int>(),
+                              slot.data_ptr<int>(), par.data_ptr<int>(), qsl.data_ptr<int>(),
+                              bnd_idx ? bnd_idx->data_ptr<int>() : nullptr, bnd_block ? bnd_block->data_ptr<int>() : nullptr,
+                              S, (int)T1, H, HV, V, (float)scale, (long long)h.stride(0), (long long)h.stride(1), (long long)h.stride(2), slm};
+            hd.parallel_for(sycl::nd_range<1>(wgs * L, L), kr);
+        });
+    };
+    if (rps == 1) launch(std::integral_constant<int, 1>{});
+    else if (rps == 2) launch(std::integral_constant<int, 2>{});
+    else if (rps == 8) launch(std::integral_constant<int, 8>{});
+    else launch(std::integral_constant<int, 4>{});
+}
+
 // DS-SUB (see draft_sample_sycl.h): compact-logit draft sampling with a device RNG counter (graph-safe)
 void exl3_draft_sample_sub(at::Tensor logits, at::Tensor idx, at::Tensor temperature, at::Tensor probs, at::Tensor token,
                            at::Tensor ctr, int64_t seed, int64_t salt) {
@@ -1351,6 +1390,57 @@ void exl3_draft_sample_sub(at::Tensor logits, at::Tensor idx, at::Tensor tempera
     };
     if (logits.scalar_type() == at::kHalf) go(reinterpret_cast<const sycl::half*>(logits.data_ptr<at::Half>()));
     else go(logits.data_ptr<float>());
+}
+
+// ---- RC-FUSED-IN: the same recompute, reading q/k/v from the conv output rows and the raw b|a gate rows,
+// computing g/beta inside and writing o and z at rows oidx (or 0..T-1). See gdn_recompute_sycl.h.
+void exl3_gdn_recompute_fused(at::Tensor x, at::Tensor ba, at::Tensor alog, at::Tensor dtb, at::Tensor o, at::Tensor z,
+                              at::Tensor zsrc, c10::optional<at::Tensor> oidx, int64_t H,
+                              at::Tensor h, at::Tensor state_idx, at::Tensor pk, at::Tensor pv, at::Tensor pg, at::Tensor pb,
+                              at::Tensor n_pend, at::Tensor slot, at::Tensor par, at::Tensor qsl, int64_t T1, double scale,
+                              c10::optional<at::Tensor> bnd_idx, c10::optional<at::Tensor> bnd_block) {
+    // x [T, 2*H*K + HV*V] fp16 (unit inner stride), ba [T, 2*HV] fp16 (b | a), alog fp32 / dtb fp16 [HV] (the live
+    // parameters: a converted copy cached at the first call went stale, it was made before the weights were loaded), zsrc [T, HV*V] fp16
+    // (unit inner stride), o/z [rows, HV, V] fp16 (inner dims contiguous), oidx int32 [T] output rows (None = 0..T-1).
+    TORCH_CHECK(x.scalar_type() == at::kHalf && ba.scalar_type() == at::kHalf && o.scalar_type() == at::kHalf);
+    TORCH_CHECK(z.scalar_type() == at::kHalf && zsrc.scalar_type() == at::kHalf);
+    TORCH_CHECK(alog.scalar_type() == at::kFloat && dtb.scalar_type() == at::kHalf && alog.is_contiguous() && dtb.is_contiguous());
+    TORCH_CHECK(h.scalar_type() == at::kFloat && pk.scalar_type() == at::kFloat && pk.dim() == 5 && pk.size(2) == T1);
+    TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1 && ba.dim() == 2 && ba.stride(1) == 1 && zsrc.dim() == 2 && zsrc.stride(1) == 1);
+    int N = state_idx.numel(), HV = o.size(-2), V = o.size(-1), S = pk.size(1), Kd = h.size(-1);
+    TORCH_CHECK(o.dim() == 3 && o.stride(2) == 1 && o.stride(1) == V && z.dim() == 3 && z.stride(2) == 1 && z.stride(1) == V && z.size(1) == HV);
+    TORCH_CHECK(Kd == exl3gdn::KD && h.size(-2) == V && h.dim() == 4 && h.stride(3) == 1);
+    TORCH_CHECK(x.size(1) == 2 * H * Kd + (int64_t)HV * V && ba.size(1) >= 2 * HV && zsrc.size(1) >= (int64_t)HV * V && alog.numel() == HV);
+    TORCH_CHECK(!oidx || (oidx->scalar_type() == at::kInt && oidx->is_contiguous() && oidx->numel() >= x.size(0)));
+    if (N == 0) return;
+    auto& qu = queue_of(x);
+    static int rps = []{ const char* e = std::getenv("EXL3_GDN_RPS"); return e ? std::atoi(e) : 4; }();
+    TORCH_CHECK(T1 <= exl3gdn::NSG && T1 <= exl3gdn::TMAX);
+    using sh = sycl::half;
+    auto launch = [&](auto tag) {
+        constexpr int R = decltype(tag)::value;
+        TORCH_CHECK(V % (exl3gdn::NSG * R) == 0);
+        size_t wgs = (size_t)N * HV * (V / (exl3gdn::NSG * R)), L = exl3gdn::NSG * exl3gdn::SG;
+        qu.submit([&](sycl::handler& hd) {
+            sycl::local_accessor<float, 1> slm(sycl::range<1>(3 * exl3gdn::TMAX * exl3gdn::KD), hd);
+            exl3gdn::Recompute<R, true> kr{nullptr, nullptr, nullptr, nullptr, nullptr,
+                              reinterpret_cast<sh*>(o.data_ptr<at::Half>()), h.data_ptr<float>(), state_idx.data_ptr<int>(),
+                              pk.data_ptr<float>(), pv.data_ptr<float>(), pg.data_ptr<float>(), pb.data_ptr<float>(), n_pend.data_ptr<int>(),
+                              slot.data_ptr<int>(), par.data_ptr<int>(), qsl.data_ptr<int>(),
+                              bnd_idx ? bnd_idx->data_ptr<int>() : nullptr, bnd_block ? bnd_block->data_ptr<int>() : nullptr,
+                              S, (int)T1, (int)H, HV, V, (float)scale, (long long)h.stride(0), (long long)h.stride(1), (long long)h.stride(2), slm,
+                              reinterpret_cast<const sh*>(x.data_ptr<at::Half>()), (long long)x.stride(0),
+                              reinterpret_cast<const sh*>(ba.data_ptr<at::Half>()), (long long)ba.stride(0),
+                              alog.data_ptr<float>(), reinterpret_cast<const sh*>(dtb.data_ptr<at::Half>()),
+                              reinterpret_cast<sh*>(z.data_ptr<at::Half>()), reinterpret_cast<const sh*>(zsrc.data_ptr<at::Half>()),
+                              (long long)zsrc.stride(0), oidx ? oidx->data_ptr<int>() : nullptr, (long long)o.stride(0), (long long)z.stride(0)};
+            hd.parallel_for(sycl::nd_range<1>(wgs * L, L), kr);
+        });
+    };
+    if (rps == 1) launch(std::integral_constant<int, 1>{});
+    else if (rps == 2) launch(std::integral_constant<int, 2>{});
+    else if (rps == 8) launch(std::integral_constant<int, 8>{});
+    else launch(std::integral_constant<int, 4>{});
 }
 
 // ---- fused residual add + RMSNorm (decode, small M), see norm_sycl.h
@@ -1804,4 +1894,8 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_fused_add_rms_norm(Tensor(a!) x, Tensor(b!) residual, Tensor weight, float eps) -> ()");
     m.impl("exl3_fused_add_rms_norm", torch::kXPU, &exl3_fused_add_rms_norm);
     m.def("exl3_set_norm_wg(int n) -> ()", &exl3_set_norm_wg);
+    m.def("exl3_gdn_recompute(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor(a!) o, Tensor(b!) h, Tensor state_idx, Tensor(c!) pk, Tensor(d!) pv, Tensor(e!) pg, Tensor(f!) pb, Tensor n_pend, Tensor slot, Tensor par, Tensor qsl, int T1, float scale, Tensor? bnd_idx=None, Tensor? bnd_block=None) -> ()");
+    m.impl("exl3_gdn_recompute", torch::kXPU, &exl3_gdn_recompute);
+    m.def("exl3_gdn_recompute_fused(Tensor x, Tensor ba, Tensor alog, Tensor dtb, Tensor(a!) o, Tensor(g!) z, Tensor zsrc, Tensor? oidx, int H, Tensor(b!) h, Tensor state_idx, Tensor(c!) pk, Tensor(d!) pv, Tensor(e!) pg, Tensor(f!) pb, Tensor n_pend, Tensor slot, Tensor par, Tensor qsl, int T1, float scale, Tensor? bnd_idx=None, Tensor? bnd_block=None) -> ()");
+    m.impl("exl3_gdn_recompute_fused", torch::kXPU, &exl3_gdn_recompute_fused);
 }
