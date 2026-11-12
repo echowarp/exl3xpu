@@ -59,11 +59,18 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_INT8KV_LBUCKET / _QBUCKET` | default (256 / 256) | oneDNN SDPA shape buckets |
 | `EXL3_DRAFT_WIN` | default (0 = off) | DRAFT-WIN: the drafter's attention sees page 0 + the last N tokens (drafts only; output unchanged) |
 | `EXL3_VERIFY16` | default (0) | 9..16-row verify on the decode kernel (split into two pseudo-requests) |
+| `EXL3_KSMOOTH` | path to a K-mean table (see "Data files") | K smoothing: store K - mean (per layer / KV head / channel) in the quantized KV cache; softmax unchanged |
+| `EXL3_KSMOOTH_CALIB` | unset | calibration: accumulate key means of the traffic (eager engine) and save the table to this path |
+| `EXL3_KSMOOTH_CALIB_EVERY` | default (1) | save the table every N batches |
+| `EXL3_KSMOOTH_ROBUST` | default (1) | calibration ignores token-heads with key norm > 3x the median (attention sinks) |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
 `num_speculative_tokens_per_batch_size=[[1,4,7],[5,5,5],[6,6,4],[7,8,3],[9,256,2]]` with
 `draft_sample_method=probabilistic` (stock vLLM 0.26 fields).
+- **K-smoothing table** (`EXL3_KSMOOTH`): run the engine eager (`enforce_eager`) with `EXL3_KSMOOTH_CALIB=ksmooth.pt`
+  and the int8 or int4 KV cache over representative prompts; the table (a `{layer: mean[H, D]}` torch file) is
+  rewritten after every batch. Then serve with `EXL3_KSMOOTH=ksmooth.pt` (and without `EXL3_KSMOOTH_CALIB`).
 - **Split-K table** (`EXL3_SHAPE_P_FILE`): `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` is a kernel timing
   measurement on a B70 for the model's matrix shapes (no traffic data); other GPUs or models need their own
   timings (`{"N,K,MB": P}` or `{"N,K,MB": [NT, P]}`).

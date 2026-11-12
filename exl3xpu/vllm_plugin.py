@@ -771,6 +771,58 @@ def _patch_int8kv_fast():
     TritonAttentionImpl.forward = _fwd8
     TritonAttentionImpl._exl3_i8_patched = True
 
+    # K smoothing (SageAttention): store K - m (per layer / kv head / channel constant). Q.(K - m) = Q.K - Q.m and Q.m is
+    # the same for every key of a query, so softmax is unchanged; m removes the common channel offsets / outliers that
+    # eat the per-token int8 range (attention sinks). EXL3_KSMOOTH=<file> applies, EXL3_KSMOOTH_CALIB=<file> measures
+    # (eager engine only: accumulates key sums of real tokens and saves {layer: mean[H, D]}).
+    ks_path, cal_path = os.environ.get("EXL3_KSMOOTH"), os.environ.get("EXL3_KSMOOTH_CALIB")
+    if ks_path or cal_path:
+        orig_upd = TritonAttentionImpl.do_kv_cache_update
+        kmeans = {}
+        if ks_path:
+            try:
+                kmeans = {k: v for k, v in torch.load(ks_path, map_location="cpu").items()}
+                logger.info("exl3: K smoothing on (%d layers from %s)", len(kmeans), ks_path)
+            except Exception as e:  # noqa
+                logger.warning("exl3: K smoothing file %s not loaded (%s)", ks_path, e)
+        cal = {"n": 0}
+
+        def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+            name = getattr(layer, "layer_name", None)
+            if (getattr(self, "_kv_quant_mode", None) == KVQuantMode.INT8_PER_TOKEN_HEAD
+                    and name is not None):
+                if cal_path:
+                    valid = slot_mapping[: key.shape[0]] >= 0
+                    ks = key[: valid.shape[0]][valid].float()
+                    if ks.shape[0] > 8 and os.environ.get("EXL3_KSMOOTH_ROBUST", "1") == "1":
+                        # robust: drop token-heads whose key norm exceeds 3x the median (attention sinks / massive
+                        # activations would otherwise dominate the mean and offset every normal key)
+                        nrm = ks.norm(dim=-1)                                  # [T, H]
+                        keep = nrm <= 3.0 * nrm.median(dim=0, keepdim=True).values
+                        ks = ks * keep.unsqueeze(-1)
+                        cnt = keep.sum(0).double().cpu()                      # [H]
+                        acc = cal.setdefault(name, [torch.zeros(key.shape[1:], dtype=torch.float64), torch.zeros(key.shape[1], dtype=torch.float64)])
+                        acc[0] += ks.sum(0).double().cpu(); acc[1] += cnt
+                        cal["n"] += 1
+                        if cal["n"] % int(os.environ.get("EXL3_KSMOOTH_CALIB_EVERY", "1")) == 0:   # every batch (a larger interval lost the tail)
+                            torch.save({k: (v[0] / v[1].clamp_min(1).unsqueeze(-1)).float() for k, v in cal.items() if k != "n"}, cal_path)
+                        ks = ks[:0]
+                    if ks.numel():
+                        # per-head count tensors in both modes (a <= 8-row batch after a robust
+                        # one crashed the save with max(1, tensor): "Boolean value of Tensor ... ambiguous")
+                        acc = cal.setdefault(name, [torch.zeros(key.shape[1:], dtype=torch.float64), torch.zeros(key.shape[1], dtype=torch.float64)])
+                        acc[0] += ks.sum(0).double().cpu(); acc[1] += ks.shape[0]
+                        cal["n"] += 1
+                        if cal["n"] % int(os.environ.get("EXL3_KSMOOTH_CALIB_EVERY", "1")) == 0:   # every batch (a larger interval lost the tail)
+                            torch.save({k: (v[0] / v[1].clamp_min(1).unsqueeze(-1)).float() for k, v in cal.items() if k != "n"}, cal_path)
+                if name in kmeans:
+                    m = getattr(self, "_exl3_km", None)
+                    if m is None or m.device != key.device:
+                        m = self._exl3_km = kmeans[name].to(device=key.device, dtype=key.dtype)
+                    key = key - m
+            return orig_upd(self, layer, key, value, kv_cache, slot_mapping)
+
+        TritonAttentionImpl.do_kv_cache_update = do_kv_cache_update
     logger.info("exl3: int8_per_token_head KV: exl3 int8 decode kernel + block-dequantized FA2 prefill")
 
 
