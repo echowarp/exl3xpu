@@ -369,6 +369,129 @@ struct HadOutKernel {
 };
 
 // ------------------------------------------------------------------------------------------------
+// Fused MLP middle: gate_up split-K partials -> had_out (gate, up) -> silu(g) * u -> had_in of down,
+// written in the blocked [kt][Mp][16] layout (pad rows zero). Same fp16 roundings as the unfused chain
+// (HadOut writes fp16, the activation kernel computes in fp32 and stores fp16, HadIn rounds x * suh to fp16).
+struct MlpMidKernel {
+    const float* part; int P, M, I;         // part [P, M, 2I]: gate = cols [0, I), up = [I, 2I)
+    const fp16* svh;                          // [2I] (gate_up output scales)
+    const fp16* suh;                          // [I]  (down input signs/scales, one shard)
+    fp16* xh;                                 // [I/16][Mp][16]
+    int Mp;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int id = it.get_global_id(0);
+        int nb_n = I / 128;
+        int j = id % nb_n, m = id / nb_n;
+        if (m >= Mp) return;
+        int kt = I / 16;
+        if (m >= M) {
+            simd<fp16, 16> z = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) block_store<fp16, 16>(xh + ((size_t)(j * 8 + i) * Mp + m) * 16, z);
+            return;
+        }
+        simd<float, 128> g = 0.0f, u = 0.0f;
+#ifdef EXL3_HADOUT_B
+        {   // same batched-load idea as HadOut (gate + up, EXL3_HADOUT_B/2 partials per batch), same order
+#pragma clang fp reassociate(off)
+        constexpr int MB2 = EXL3_HADOUT_B / 2 > 0 ? EXL3_HADOUT_B / 2 : 1;
+        int p = 0;
+        for (; p + MB2 <= P; p += MB2) {
+            simd<float, 128> tg[MB2], tu[MB2];
+#pragma unroll
+            for (int b = 0; b < MB2; ++b) {
+                tg[b] = block_load<float, 128>(part + ((size_t)(p + b) * M + m) * 2 * I + j * 128);
+                tu[b] = block_load<float, 128>(part + ((size_t)(p + b) * M + m) * 2 * I + I + j * 128);
+            }
+#pragma unroll
+            for (int b = 0; b < MB2; ++b) { g += tg[b]; u += tu[b]; }
+        }
+        for (; p < P; ++p) {
+            g += block_load<float, 128>(part + ((size_t)p * M + m) * 2 * I + j * 128);
+            u += block_load<float, 128>(part + ((size_t)p * M + m) * 2 * I + I + j * 128);
+        }
+        }
+#else
+        for (int p = 0; p < P; ++p) {
+            g += block_load<float, 128>(part + ((size_t)p * M + m) * 2 * I + j * 128);
+            u += block_load<float, 128>(part + ((size_t)p * M + m) * 2 * I + I + j * 128);
+        }
+#endif
+        fwht128(g); fwht128(u);
+        simd<fp16, 128> gh = convert<fp16>(g * kRsqrt128 * convert<float>(block_load<fp16, 128>(svh + j * 128)));
+        simd<fp16, 128> uh = convert<fp16>(u * kRsqrt128 * convert<float>(block_load<fp16, 128>(svh + I + j * 128)));
+        simd<float, 128> gf = convert<float>(gh);
+        simd<float, 128> a = gf / (1.0f + exp(-gf)) * convert<float>(uh);
+        simd<float, 128> v = convert<float>(convert<fp16>(a)) * convert<float>(block_load<fp16, 128>(suh + j * 128));
+        v = convert<float>(convert<fp16>(v));
+        fwht128(v);
+        v *= kRsqrt128;
+        simd<fp16, 128> vh = convert<fp16>(v);
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            block_store<fp16, 16>(xh + ((size_t)(j * 8 + i) * Mp + m) * 16, vh.template select<16, 1>(i * 16));
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+// Prefill MLP middle: gate_up GEMM output y (fp16, pre output-Hadamard) -> had_out (gate, up)
+// -> silu(g) * u -> had_in of down -> int8 with one scale per row, in ONE pass (was HadOut + act kernel + HadInQ8:
+// ~3.4x the memory traffic). Same roundings as the unfused chain: HadOut stores fp16, the activation is computed in
+// fp32 from fp16 g/u and stored fp16, HadInQ8 rounds x*suh and the transform to fp16 before taking the row max.
+// One work-group of TPR threads per row; each thread handles up to NB 128-blocks of the I-wide down input.
+template <int TPR, int NB>
+struct MlpMidQ8WgKernel {
+    const fp16* y; int ldy;                   // [M, 2I]: gate = cols [0, I), up = [I, 2I)
+    const fp16* svh;                          // [2I] gate_up output scales
+    const fp16* suh;                          // [I]  down input signs/scales (one shard)
+    int8_t* xq; float* sx;                    // [Ms, I] int8, [Ms] scales
+    int M, I;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<TPR * sizeof(float)>();
+        int t = it.get_local_id(0);
+        int m = it.get_group(0);
+        int kb_n = I / 128;
+        simd<fp16, 128 * NB> buf;
+        simd<float, 128> mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+            int kb = t + j * TPR;
+            if (kb < kb_n) {
+                simd<float, 128> g = convert<float>(block_load<fp16, 128>(y + (size_t)m * ldy + kb * 128));
+                simd<float, 128> u = convert<float>(block_load<fp16, 128>(y + (size_t)m * ldy + I + kb * 128));
+                fwht128(g); fwht128(u);
+                simd<fp16, 128> gh = convert<fp16>(g * kRsqrt128 * convert<float>(block_load<fp16, 128>(svh + kb * 128)));
+                simd<fp16, 128> uh = convert<fp16>(u * kRsqrt128 * convert<float>(block_load<fp16, 128>(svh + I + kb * 128)));
+                simd<float, 128> gf = convert<float>(gh);
+                simd<float, 128> a = gf / (1.0f + exp(-gf)) * convert<float>(uh);
+                simd<float, 128> v = convert<float>(convert<fp16>(a)) * convert<float>(block_load<fp16, 128>(suh + kb * 128));
+                v = convert<float>(convert<fp16>(v));
+                fwht128(v);
+                v *= kRsqrt128;
+                simd<fp16, 128> vh = convert<fp16>(v);
+                buf.template select<128, 1>(j * 128) = vh;
+                mx = max(mx, abs(convert<float>(vh)));
+            }
+        }
+        slm_scalar_store<float>(t * sizeof(float), hmax<float>(mx));
+        barrier();
+        float amax = hmax<float>(slm_block_load<float, TPR>(0));
+        float sc = amax > 0.0f ? amax / 127.0f : 1.0f;
+        float inv = 1.0f / sc;
+        if (t == 0) sx[m] = sc;
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+            int kb = t + j * TPR;
+            if (kb < kb_n) {
+                simd<fp16, 128> b = buf.template select<128, 1>(j * 128);
+                simd<float, 128> r = rnde<float>(convert<float>(b) * inv);
+                block_store<int8_t, 128>(xq + (size_t)m * I + kb * 128, convert<int8_t>(r));
+            }
+        }
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
 // Prefill W8A8: had_in to int8 with one scale per (group, row). Thread = (g, m), two passes over the row
 // (max, then quantize); the pre-quantization values are exactly the fp16 path's xh.
 

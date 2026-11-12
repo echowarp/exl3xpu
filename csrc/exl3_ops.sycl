@@ -794,6 +794,179 @@ void exl3_stream_probe(at::Tensor trellis, at::Tensor out, int64_t M) {
     q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), k); });
 }
 
+// ---- fused MLP for decode batches (3 <= M <= 8, DPAS MB=8): had_in -> gate_up DPAS -> MlpMid -> down DPAS -> had_out
+template <int K>
+static at::Tensor dpas8_parts(const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard, int M, int Kdim, int N,
+                              sycl::queue& q) {
+    int tk = Kdim / 16, n_strips = (N / 16) / EXL3_DPAS8_NT;
+    int P = std::max(1, std::min(tk, (g_target_threads_mb16 + n_strips - 1) / n_strips));
+    int rps = (tk + P - 1) / P;
+    P = (tk + rps - 1) / rps;
+    auto part = at::empty({P, M, N}, xh.options().dtype(at::kFloat));
+    launch_dpas<K, 2, 8, EXL3_DPAS8_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q);
+    return part;
+}
+void exl3_mlp_small(at::Tensor x, at::Tensor gu_tr, at::Tensor gu_suh, at::Tensor gu_svh, at::Tensor gu_shard,
+                    at::Tensor dn_tr, at::Tensor dn_suh, at::Tensor dn_svh, at::Tensor dn_shard, at::Tensor out,
+                    int64_t K_gu, int64_t K_dn) {
+    TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kHalf && x.stride(1) == 1 && out.scalar_type() == at::kHalf);
+    TORCH_CHECK(gu_suh.size(0) == 1 || gu_suh.size(0) == 2, "gate_up: 1 or 2 input shards");
+    TORCH_CHECK(dn_suh.size(0) == 1, "down: one shard");
+    int M = x.size(0), H = x.size(1), N2 = gu_svh.size(0), I = N2 / 2, Hn = dn_svh.size(0);
+    TORCH_CHECK(M >= 1 && M <= 8 && dn_suh.size(1) == I && out.size(0) == M && out.size(1) == Hn);
+    auto& q = queue_of(x);
+    const int Mp = 8, S = gu_suh.size(0);
+    auto xh = at::empty({S, Mp, H}, x.options());
+    launch_had_in<fp16>(x, gu_suh, xh, q);
+    at::Tensor part = K_gu == 4 ? dpas8_parts<4>(xh, gu_tr, gu_shard, M, H, N2, q) : dpas8_parts<6>(xh, gu_tr, gu_shard, M, H, N2, q);
+    auto xh2 = at::empty({1, Mp, I}, x.options());
+    MlpMidKernel mk{part.data_ptr<float>(), (int)part.size(0), M, I, reinterpret_cast<const fp16*>(gu_svh.data_ptr()),
+                    reinterpret_cast<const fp16*>(dn_suh.data_ptr()), reinterpret_cast<fp16*>(xh2.data_ptr()), Mp};
+    int n = Mp * (I / 128);
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), mk); });
+    at::Tensor part2 = K_dn == 4 ? dpas8_parts<4>(xh2, dn_tr, dn_shard, M, I, Hn, q) : dpas8_parts<6>(xh2, dn_tr, dn_shard, M, I, Hn, q);
+    launch_had_out<fp16>(part2, (int)part2.size(0), dn_svh, out, q);
+}
+at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
+                       std::vector<int64_t> group_bounds, int64_t K, int64_t cb, int64_t small_m_max, int64_t slice_n);
+// Whole MLP (gate_up -> silu*mul -> down) as one op, decided at run time (vLLM traces the model once with a symbolic
+// batch size, so a Python-side shape branch would be frozen): fused path for 3..8 fp16 rows, else the two EXL3
+// linears with the activation computed in fp32 and stored in the input dtype (as vLLM's act_and_mul).
+#ifdef EXL3_DNNL
+// prefill MLP with the middle fused (MlpMidQ8WgKernel): had_in_q8(x) -> int8 GEMM gate_up
+// -> [had_out + silu*mul + had_in_q8(down)] in one pass -> int8 GEMM down -> had_out. Toggle: exl3_set_mlp_mid_q8.
+static bool g_mlp_mid_q8 = true;
+void exl3_set_mlp_mid_q8(int64_t on) { g_mlp_mid_q8 = on != 0; }
+template <int K> static void launch_reconstruct_q8(const at::Tensor& tr, at::Tensor& w, int n0, sycl::queue& q);
+static void q8_gemm_groups(sycl::queue& q, const at::Tensor& like, const at::Tensor& xq, const at::Tensor& sx, int64_t Ms, int64_t k,
+                           const at::Tensor& trellis, int64_t K, const std::vector<int64_t>& bounds, at::Tensor& y, int64_t n) {
+    static std::vector<at::Tensor> swd(16);
+    auto& swt = swd.at(like.device().index());
+    if (!swt.defined()) swt = at::full({1}, kQ8WMax / 127.0f, like.options().dtype(at::kFloat));
+    for (size_t g = 0; g + 1 < bounds.size(); ++g) {
+        int64_t g0 = bounds[g], g1 = bounds[g + 1], ng = g1 - g0;
+        auto w = at::empty({k, ng}, like.options().dtype(at::kChar));
+        if (K == 4) launch_reconstruct_q8<4>(trellis, w, g0, q); else launch_reconstruct_q8<6>(trellis, w, g0, q);
+        q8dnnl::gemm(q, like, reinterpret_cast<const int8_t*>(xq.data_ptr()) + g * Ms * k,
+                     reinterpret_cast<const int8_t*>(w.data_ptr()), swt.data_ptr<float>(),
+                     sx.data_ptr<float>() + g * Ms, reinterpret_cast<fp16*>(y.data_ptr()) + g0, Ms, k, ng, n);
+    }
+}
+static at::Tensor exl3_mlp_prefill_q8(const at::Tensor& x2, const at::Tensor& gu_tr, const at::Tensor& gu_suh, const at::Tensor& gu_svh,
+                                      const std::vector<int64_t>& gu_bounds, const at::Tensor& dn_tr, const at::Tensor& dn_suh,
+                                      const at::Tensor& dn_svh, const std::vector<int64_t>& dn_bounds, int64_t K_gu, int64_t K_dn) {
+    auto& q = queue_of(x2);
+    auto xc = x2.is_contiguous() ? x2 : x2.contiguous();
+    const int64_t M = xc.size(0), k = xc.size(1), n_gu = gu_svh.size(0), I = n_gu / 2, n_dn = dn_svh.size(0);
+    const int64_t Ms = (M + 255) / 256 * 256, S = gu_suh.size(0);
+    // 1. had_in_q8 of x (as exl3_linear)
+    auto xq = at::empty({S, Ms, k}, xc.options().dtype(at::kChar));
+    auto sx = at::empty({S, Ms}, xc.options().dtype(at::kFloat));
+    {
+        int n_in = (int)(S * M), kb_n = (int)(k / 128);
+        auto wg = [&](auto kern, int tpr) {
+            q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)n_in * tpr, tpr), kern); });
+        };
+        if (kb_n <= 8 * 6)
+            wg(HadInQ8WgKernel<fp16, 8, 6>{reinterpret_cast<const fp16*>(xc.data_ptr()), reinterpret_cast<const fp16*>(gu_suh.data_ptr()),
+                                           reinterpret_cast<int8_t*>(xq.data_ptr()), sx.data_ptr<float>(), (int)M, (int)k, (int)S,
+                                           (int)xc.stride(0), (int)Ms}, 8);
+        else
+            wg(HadInQ8WgKernel<fp16, 16, 9>{reinterpret_cast<const fp16*>(xc.data_ptr()), reinterpret_cast<const fp16*>(gu_suh.data_ptr()),
+                                            reinterpret_cast<int8_t*>(xq.data_ptr()), sx.data_ptr<float>(), (int)M, (int)k, (int)S,
+                                            (int)xc.stride(0), (int)Ms}, 16);
+    }
+    // 2. gate_up GEMM (output stays in the rotated basis: no had_out here)
+    auto y = at::empty({Ms, n_gu}, xc.options().dtype(at::kHalf));
+    q8_gemm_groups(q, xc, xq, sx, Ms, k, gu_tr, K_gu, gu_bounds, y, n_gu);
+    // 3. fused middle -> down input int8 + row scales
+    auto xq2 = at::empty({1, Ms, I}, xc.options().dtype(at::kChar));
+    auto sx2 = at::empty({1, Ms}, xc.options().dtype(at::kFloat));
+    {
+        MlpMidQ8WgKernel<16, 9> kmid{reinterpret_cast<const fp16*>(y.data_ptr()), (int)n_gu,
+                                     reinterpret_cast<const fp16*>(gu_svh.data_ptr()), reinterpret_cast<const fp16*>(dn_suh.data_ptr()),
+                                     reinterpret_cast<int8_t*>(xq2.data_ptr()), sx2.data_ptr<float>(), (int)M, (int)I};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)M * 16, 16), kmid); });
+    }
+    // 4. down GEMM + output Hadamard
+    auto y2 = at::empty({Ms, n_dn}, xc.options().dtype(at::kHalf));
+    if (g_q8_fold && M >= g_q8_fold_min_m) {
+        auto& fs = fold_scales(dn_tr, dn_svh, K_dn, q);
+        for (size_t g = 0; g + 1 < dn_bounds.size(); ++g) {
+            int64_t g0 = dn_bounds[g], g1 = dn_bounds[g + 1], ng = g1 - g0;
+            auto w = at::empty({I, ng}, xc.options().dtype(at::kChar));
+            if (K_dn == 4) launch_reconstruct_q8_fold<4>(dn_tr, w, g0, fs.first.data_ptr<float>(), q);
+            else launch_reconstruct_q8_fold<6>(dn_tr, w, g0, fs.first.data_ptr<float>(), q);
+            q8dnnl::gemm(q, xc, reinterpret_cast<const int8_t*>(xq2.data_ptr()), reinterpret_cast<const int8_t*>(w.data_ptr()),
+                         fs.second.data_ptr<float>() + g0, sx2.data_ptr<float>(), reinterpret_cast<fp16*>(y2.data_ptr()) + g0,
+                         Ms, I, ng, n_dn, true);
+        }
+        return y2.narrow(0, 0, M);
+    }
+    q8_gemm_groups(q, xc, xq2, sx2, Ms, I, dn_tr, K_dn, dn_bounds, y2, n_dn);
+    auto out = at::empty({M, n_dn}, xc.options());
+    exl3_had_out_h(y2.narrow(0, 0, M), dn_svh, out);
+    return out;
+}
+#endif
+
+at::Tensor exl3_mlp_auto(at::Tensor x, at::Tensor gu_tr, at::Tensor gu_suh, at::Tensor gu_svh, at::Tensor gu_shard,
+                         std::vector<int64_t> gu_bounds, at::Tensor dn_tr, at::Tensor dn_suh, at::Tensor dn_svh,
+                         at::Tensor dn_shard, std::vector<int64_t> dn_bounds, int64_t K_gu, int64_t K_dn, int64_t cb,
+                         int64_t small_m_max, int64_t slice_n) {
+    auto shape = x.sizes().vec();
+    auto x2 = x.reshape({-1, x.size(-1)});
+    int64_t M = x2.size(0);
+    shape.back() = dn_svh.size(0);
+    if (M >= 3 && M <= 8 && x2.scalar_type() == at::kHalf && cb == 2 && (K_gu == 4 || K_gu == 6) &&
+        (K_dn == 4 || K_dn == 6) && gu_suh.size(0) <= 2 && dn_suh.size(0) == 1 && gu_svh.size(0) % 256 == 0) {
+        if (!x2.is_contiguous()) x2 = x2.contiguous();
+        auto out = at::empty({M, dn_svh.size(0)}, x2.options());
+        exl3_mlp_small(x2, gu_tr, gu_suh, gu_svh, gu_shard, dn_tr, dn_suh, dn_svh, dn_shard, out, K_gu, K_dn);
+        return out.view(shape);
+    }
+#ifdef EXL3_DNNL
+    if (g_mlp_mid_q8 && g_int8 && cb == 2 && (K_gu == 4 || K_gu == 6) && (K_dn == 4 || K_dn == 6) && M > small_m_max && M > 16 &&
+        x2.scalar_type() == at::kHalf && dn_suh.size(0) == 1 && (gu_svh.size(0) / 2) % 128 == 0 &&
+        gu_svh.size(0) / 2 / 128 <= 16 * 9 && x2.size(1) / 128 <= 16 * 9) {
+        return exl3_mlp_prefill_q8(x2, gu_tr, gu_suh, gu_svh, gu_bounds, dn_tr, dn_suh, dn_svh, dn_bounds, K_gu, K_dn).view(shape);
+    }
+#endif
+    auto gu = exl3_linear(x2, gu_tr, gu_suh, gu_svh, gu_shard, gu_bounds, K_gu, cb, small_m_max, slice_n);
+    int64_t I = gu.size(-1) / 2;
+    at::Tensor a;
+    if (gu.scalar_type() == at::kHalf && gu.is_contiguous() && I % 8 == 0) {
+        // silu(g) * u in fp32, stored fp16 (as vLLM's act_and_mul), no fp32 temporaries (prefill-sized M)
+        a = at::empty({M, I}, gu.options());
+        const sycl::half* src = reinterpret_cast<const sycl::half*>(gu.data_ptr());
+        sycl::half* dst = reinterpret_cast<sycl::half*>(a.data_ptr());
+        int64_t n8 = M * I / 8, I8 = I / 8;
+        queue_of(gu).parallel_for(sycl::range<1>(n8), [=](sycl::id<1> id) {
+            int64_t k = id[0], m = k / I8, c = (k % I8) * 8;
+            auto g8 = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(src + m * 2 * I + c);
+            auto u8 = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(src + m * 2 * I + I + c);
+            sycl::vec<sycl::half, 8> o;
+            for (int j = 0; j < 8; ++j) {
+                float g = (float)g8[j];
+                o[j] = (sycl::half)(g / (1.0f + sycl::exp(-g)) * (float)u8[j]);
+            }
+            *reinterpret_cast<sycl::vec<sycl::half, 8>*>(dst + m * I + c) = o;
+        });
+    } else {
+        auto g = gu.narrow(-1, 0, I).to(at::kFloat), u = gu.narrow(-1, I, I).to(at::kFloat);
+        a = (at::silu(g) * u).to(x2.scalar_type());
+    }
+    return exl3_linear(a, dn_tr, dn_suh, dn_svh, dn_shard, dn_bounds, K_dn, cb, small_m_max, slice_n).view(shape);
+}
+
+at::Tensor exl3_mlp_small_f(at::Tensor x, at::Tensor gu_tr, at::Tensor gu_suh, at::Tensor gu_svh, at::Tensor gu_shard,
+                            at::Tensor dn_tr, at::Tensor dn_suh, at::Tensor dn_svh, at::Tensor dn_shard, int64_t K_gu, int64_t K_dn) {
+    auto x2 = x.is_contiguous() ? x : x.contiguous();
+    auto out = at::empty({x2.size(0), dn_svh.size(0)}, x2.options());
+    exl3_mlp_small(x2, gu_tr, gu_suh, gu_svh, gu_shard, dn_tr, dn_suh, dn_svh, dn_shard, out, K_gu, K_dn);
+    return out;
+}
+
 bool exl3_supported(int64_t K, int64_t cb);
 
 // ------------------------------------------------------------------------------------------------
@@ -957,6 +1130,7 @@ void exl3_set_wave_cap(int64_t n) { g_wave_cap = (int)n; }
 TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_int8(int on) -> ()", &exl3_set_int8);
 #ifdef EXL3_DNNL
+    m.def("exl3_set_mlp_mid_q8(int on) -> ()", &exl3_set_mlp_mid_q8);
     m.def("exl3_set_q8_fold(int on) -> ()", &exl3_set_q8_fold);
 #endif
 #ifdef EXL3_DNNL
@@ -996,5 +1170,11 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_local(int n) -> ()", &exl3_set_local);
     m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
     m.def("exl3_fa_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
+    m.def("exl3_mlp_small(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, Tensor(a!) out, int K_gu, int K_dn) -> ()");
+    m.impl("exl3_mlp_small", torch::kXPU, &exl3_mlp_small);
+    m.def("mlp_small(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, int K_gu, int K_dn) -> Tensor");
+    m.impl("mlp_small", torch::kXPU, &exl3_mlp_small_f);
+    m.def("mlp_auto(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, int[] gu_bounds, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, int[] dn_bounds, int K_gu, int K_dn, int cb, int small_m_max, int slice_n) -> Tensor");
+    m.impl("mlp_auto", torch::kXPU, &exl3_mlp_auto);
     m.impl("exl3_fa_fwd", torch::kXPU, &exl3_fa_fwd);
 }

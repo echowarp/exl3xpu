@@ -422,10 +422,57 @@ def _patch_mtp_draft_logits():
 
     cls.compute_logits = compute_logits
     cls._exl3_patched = True
+def _patch_fused_mlp():
+    """Decode-batch MLP (3..8 rows) as one exl3xpu op: had_in -> gate_up DPAS -> fused
+    had_out(gate, up) + silu*mul + had_in(down) -> down DPAS -> had_out (3 fewer kernels per layer; -9% MLP time in
+    a microbenchmark; same math, fp16-rounding-level differences). EXL3_FUSED_MLP=0 disables."""
+    if os.environ.get("EXL3_FUSED_MLP", "1") != "1":
+        return
+    try:
+        from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
+    except Exception:
+        return
+    if getattr(Qwen2MoeMLP, "_exl3_mlp_patched", False):
+        return
+    try:
+        from . import ops
+        E = ops._get_esimd()
+        if not E or not hasattr(torch.ops.exl3xpu_C, "mlp_auto"):
+            return
+    except Exception as e:  # noqa
+        logger.info("exl3: fused MLP not available here (%s)", e)
+        return
+    try:
+        @torch.library.register_fake("exl3xpu_C::mlp_auto")
+        def _(x, gu_tr, gu_suh, gu_svh, gu_shard, gu_bounds, dn_tr, dn_suh, dn_svh, dn_shard, dn_bounds, K_gu, K_dn, cb,
+              small_m_max, slice_n):
+            return x.new_empty((*x.shape[:-1], dn_svh.shape[0]))
+    except Exception as e:  # noqa
+        logger.warning("exl3: fused MLP fake impl not registered (%s); fused MLP off", e)
+        return
+    orig = Qwen2MoeMLP.forward
+
+    def forward(self, x):
+        gu, dn = self.gate_up_proj, self.down_proj
+        # static (per-layer) conditions only: the batch-size decision is made inside the op at run time
+        if (getattr(gu, "exl3_cpp", False) and getattr(dn, "exl3_cpp", False) and gu.exl3_cb == dn.exl3_cb
+                and len(gu.exl3_bounds) == 3 and len(dn.exl3_bounds) == 2 and getattr(gu, "bias", None) is None):
+            from . import ops as _ops
+            return torch.ops.exl3xpu_C.mlp_auto(x, gu.trellis, gu.suh, gu.svh, gu.exl3_shard_of_nb, gu.exl3_bounds,
+                                                dn.trellis, dn.suh, dn.svh, dn.exl3_shard_of_nb, dn.exl3_bounds,
+                                                gu.exl3_K, dn.exl3_K, gu.exl3_cb, _ops.SMALL_M_MAX, _ops.RECON_SLICE_N)
+        return orig(self, x)
+
+    Qwen2MoeMLP.forward = forward
+    Qwen2MoeMLP._exl3_mlp_patched = True
+    logger.info("exl3: fused decode MLP enabled (3..8 rows)")
+
+
 
 
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
+    _patch_fused_mlp()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()
     if os.environ.get("EXL3_VLLM_PATCHES", "1") != "0":
