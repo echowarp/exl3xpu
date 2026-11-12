@@ -1392,12 +1392,164 @@ def _patch_int8kv_fast():
     logger.info("exl3: int8_per_token_head KV: exl3 int8 decode kernel + block-dequantized FA2 prefill")
 
 
+# ---- ported from the CUDA plugin (exl3cuda/vllm_plugin.py):
+# dynamic speculative depth with FULL decode graphs per q, and the UNIFORM-SPEC misdispatch fix (default off on the Arc).
+def _patch_dyn_sd_full():
+    """EXL3_DYN_SD_FULL=1: keep FULL_AND_PIECEWISE cudagraphs with dynamic speculative depth
+    (speculative_config.num_speculative_tokens_per_batch_size). Upstream drops to PIECEWISE "for reliability"; on the
+    v1 runner a FULL graph is only dispatched for uniform decode batches with query length 1 + num_speculative_tokens
+    and the exact request count (BatchDescriptor num_reqs), so steps with a smaller k take PIECEWISE graphs and steps
+    with the full k (low concurrency) keep FULL graphs. Measured without this: dynamic k = -44% at 1 stream."""
+    if os.environ.get("EXL3_DYN_SD_FULL", "0") not in ("1", "2"):
+        return
+    from vllm.config.vllm import VllmConfig
+
+    def _keep(self):
+        sc = self.speculative_config
+        if sc is not None and sc.uses_dynamic_speculative_decoding():
+            logger.info("EXL3_DYN_SD_FULL: dynamic speculative depth %s with cudagraph_mode %s (not forced to "
+                        "PIECEWISE)", sc.num_speculative_tokens_per_batch_size, self.compilation_config.cudagraph_mode.name)
+    VllmConfig._maybe_override_dynamic_sd_cudagraph_mode = _keep
+    if os.environ.get("EXL3_DYN_SD_FULL") == "2":
+        _patch_multi_q_full_graphs()
+
+
+def _patch_multi_q_full_graphs():
+    """EXL3_DYN_SD_FULL=2: FULL decode cudagraphs for EVERY spec depth in the dynamic schedule, not only
+    the maximum one. Upstream (v1 runner) captures FULL uniform-decode graphs for query length 1 + num_speculative_tokens
+    only, so a step with a smaller k takes PIECEWISE graphs (measured: 2 streams at k=5 163 vs 309 tok/s). Here the
+    dispatcher also gets FULL keys (b*q tokens, b requests, uniform) for each other q = 1 + k of the schedule and every
+    b <= max_num_seqs, the capture of those keys runs with the runner's/dispatcher's query length switched to q, and at
+    runtime a step whose requests all have q tokens dispatches with that q. Keys of different q never collide: FULL
+    descriptors carry (num_tokens, num_reqs) and num_tokens = q * num_reqs."""
+    from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+    from vllm.forward_context import BatchDescriptor
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    def _qlens(vllm_config):
+        sc = vllm_config.speculative_config
+        sched = getattr(sc, "num_speculative_tokens_per_batch_size", None) if sc else None
+        return sorted({1 + int(e[2]) for e in sched}) if sched else []
+
+    _orig_init = CudagraphDispatcher.initialize_cudagraph_keys
+
+    def _init_keys(self, cudagraph_mode, uniform_decode_query_len=1):
+        _orig_init(self, cudagraph_mode, uniform_decode_query_len)
+        self._llmt_q = None
+        if cudagraph_mode == CUDAGraphMode.NONE or cudagraph_mode.decode_mode() != CUDAGraphMode.FULL \
+                or not cudagraph_mode.separate_routine():
+            return
+        max_size = self.compilation_config.max_cudagraph_capture_size or 0
+        added = []
+        for q in _qlens(self.vllm_config):
+            if q == uniform_decode_query_len:
+                continue
+            for b in range(1, self.vllm_config.scheduler_config.max_num_seqs + 1):
+                if b * q <= max_size:
+                    self.add_cudagraph_key(CUDAGraphMode.FULL, BatchDescriptor(num_tokens=b * q, num_reqs=b, uniform=True))
+                    added.append((q, b))
+        logger.info("EXL3_DYN_SD_FULL=2: +%d FULL decode cudagraph keys for query lengths %s",
+                    len(added), sorted({q for q, _ in added}))
+
+    _orig_pad = CudagraphDispatcher._create_padded_batch_descriptor
+
+    def _pad(self, num_tokens, uniform_decode, has_lora, num_active_loras=0):
+        q = getattr(self, "_llmt_q", None)
+        if uniform_decode and q and num_tokens % q == 0:
+            return BatchDescriptor(num_tokens=num_tokens, num_reqs=num_tokens // q, uniform=True, has_lora=has_lora,
+                                   num_active_loras=num_active_loras)
+        return _orig_pad(self, num_tokens, uniform_decode, has_lora, num_active_loras)
+
+    CudagraphDispatcher.initialize_cudagraph_keys = _init_keys
+    CudagraphDispatcher._create_padded_batch_descriptor = _pad
+
+    def _with_q(runner, q, fn):
+        d = runner.cudagraph_dispatcher
+        saved = (runner.uniform_decode_query_len, getattr(d, "_llmt_q", None), d.uniform_decode_query_len)
+        runner.uniform_decode_query_len, d._llmt_q, d.uniform_decode_query_len = q, q, q
+        try:
+            return fn()
+        finally:
+            runner.uniform_decode_query_len, d._llmt_q, d.uniform_decode_query_len = saved
+
+    _orig_cap = GPUModelRunner._warmup_and_capture
+
+    def _cap(self, desc, cudagraph_runtime_mode, *a, **k):
+        if desc.uniform and desc.num_reqs and desc.num_tokens // desc.num_reqs != self.uniform_decode_query_len:
+            q = desc.num_tokens // desc.num_reqs
+            return _with_q(self, q, lambda: _orig_cap(self, desc, cudagraph_runtime_mode, *a, **k))
+        return _orig_cap(self, desc, cudagraph_runtime_mode, *a, **k)
+
+    GPUModelRunner._warmup_and_capture = _cap
+
+    _orig_det = GPUModelRunner._determine_batch_execution_and_padding
+
+    def _det(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, *a, **k):
+        q = int(max_num_scheduled_tokens)
+        if (q != self.uniform_decode_query_len and k.get("force_uniform_decode") is None
+                and q in getattr(self, "_llmt_qset", ()) and num_tokens == q * num_reqs):
+            return _with_q(self, q, lambda: _orig_det(self, num_tokens, num_reqs, num_scheduled_tokens_np,
+                                                      max_num_scheduled_tokens, *a, **k))
+        return _orig_det(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, *a, **k)
+
+    GPUModelRunner._determine_batch_execution_and_padding = _det
+
+    _orig_rinit = GPUModelRunner.__init__
+
+    def _rinit(self, vllm_config, *a, **k):
+        _orig_rinit(self, vllm_config, *a, **k)
+        self._llmt_qset = set(_qlens(vllm_config))
+
+    GPUModelRunner.__init__ = _rinit
+
+
+def _patch_uniform_spec_only():
+    """UNIFORM-SPEC (EXL3_UNIFORM_SPEC=1; 0 = upstream): upstream calls a step "uniform
+    decode" from token counts alone (every request has 1 + k scheduled tokens), so a PREFILL chunk of exactly 1 + k
+    tokens (a 13-token prompt at k = 12; with dynamic depth also 4 and 8 tokens, e.g. the last few tokens after a
+    --prefix-match-unit stop or a block-aligned chunk split) was dispatched as a spec decode: FULL decode cudagraph whose
+    GDN layers run the spec-decode kernels (accepted-count conv window, recompute pool) on metadata built for a prefill
+    -> NaN logits at the first decode (NAN-PREEMPT recomputes, same split -> again). Same class as GDN-1TOK. Here a step
+    counts as uniform decode only if every scheduled request is a spec decode (drafts scheduled, 1 + drafts tokens)."""
+    if os.environ.get("EXL3_UNIFORM_SPEC", "0") != "1":
+        return
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    _orig_exec = GPUModelRunner.execute_model
+
+    def execute_model(self, scheduler_output, *a, **k):
+        try:
+            spec = scheduler_output.scheduled_spec_decode_tokens or {}
+            nst = scheduler_output.num_scheduled_tokens
+            self._llmt_all_spec = bool(nst) and len(spec) == len(nst) and all(
+                nst.get(r, 0) == len(d) + 1 for r, d in spec.items())
+        except Exception:
+            self._llmt_all_spec = None
+        return _orig_exec(self, scheduler_output, *a, **k)
+    GPUModelRunner.execute_model = execute_model
+
+    _orig_det = GPUModelRunner._determine_batch_execution_and_padding
+
+    def _det(self, *a, **k):
+        if k.get("force_uniform_decode") is None and getattr(self, "_llmt_all_spec", None) is False:
+            k["force_uniform_decode"] = False
+            self._llmt_us_n = getattr(self, "_llmt_us_n", 0) + 1
+            if self._llmt_us_n <= 3 or self._llmt_us_n % 1000 == 0:
+                logger.info("exl3: UNIFORM-SPEC: step with prefill/non-spec rows kept off the uniform-decode path (%d)",
+                            self._llmt_us_n)
+        return _orig_det(self, *a, **k)
+    GPUModelRunner._determine_batch_execution_and_padding = _det
+    logger.info("exl3: UNIFORM-SPEC on (uniform-decode dispatch only for all-spec-decode steps)")
+
+
 
 
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     _patch_fused_mlp()
     _patch_fast_norm()
+    _patch_dyn_sd_full()
+    _patch_uniform_spec_only()
     _patch_gdn_recompute()
     _patch_int8kv_fast()
     if os.environ.get("EXL3_DS_SUB", "0") == "1" or os.environ.get("EXL3_DRAFT_GRAPH", "0") == "1":

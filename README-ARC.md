@@ -89,6 +89,8 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_GDN_PORT` | path of `gdnchunk.so` | GDN-PORT: non-spec prefill rows on the 16-row chunked GDN prefill (deterministic); vLLM patch: `gdn_attn.py` metadata `pos0` |
 | `EXL3_GDN_PORT_TOKINDX` | 1 | mixed steps: the port reads/writes the rows in place (no gather/scatter) |
 | `EXL3_GDN_PORT_TRACE` | default (0) | debug: per-step checksums in the log |
+| `EXL3_DYN_SD_FULL` | 2 | 1: keep FULL decode graphs with a dynamic speculative depth schedule; 2: also capture FULL graphs for every depth of the schedule |
+| `EXL3_UNIFORM_SPEC` | 1 | uniform-decode dispatch only for all-spec-decode steps (a prefill chunk of exactly 1 + k tokens is not run as a spec decode) |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
