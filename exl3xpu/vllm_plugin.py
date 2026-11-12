@@ -242,12 +242,23 @@ class Exl3LinearMethod(LinearMethodBase):
         layer.exl3_bounds = bounds
         if isinstance(layer, ParallelLMHead) and os.environ.get("EXL3_DRAFT_VOCAB") and _spec_is_mtp():
             _build_draft_head(layer, os.environ["EXL3_DRAFT_VOCAB"])
+            # GRADED-DRAFT: a smaller draft vocab for the deeper draft positions
+            # (EXL3_DRAFT_VOCAB_FAR, from position EXL3_DRAFT_FAR_FROM, 0-based): those passes read fewer head blocks.
+            if os.environ.get("EXL3_DRAFT_VOCAB_FAR"):
+                _build_draft_head(layer, os.environ["EXL3_DRAFT_VOCAB_FAR"], attr="exl3_draft_far")
         cb = self.cb
         if hasattr(layer, "mcg"):
             cb = 1
         elif hasattr(layer, "mul1"):
             cb = 2
         layer.exl3_cb = cb
+        if isinstance(layer, ParallelLMHead) and os.environ.get("EXL3_DRAFT_Q4"):   # DRAFT-Q4
+            # EXL3_DRAFT_Q4_SCOPE=far (keep the high accuracy close, low accuracy far out): int4 only for
+            # the far head (passes >= EXL3_DRAFT_FAR_FROM); default "all" = both heads
+            attrs = ("exl3_draft_far",) if os.environ.get("EXL3_DRAFT_Q4_SCOPE", "all") == "far" else ("exl3_draft", "exl3_draft_far")
+            for attr in attrs:
+                if getattr(layer, attr, None) is not None:
+                    _build_draft_q4(layer, getattr(layer, attr), int(os.environ["EXL3_DRAFT_Q4"]))
         # decide the backend once, outside any traced code: the all-C++ op when the ESIMD library has it
         from . import ops
         E = ops._get_esimd()
@@ -370,6 +381,9 @@ class Exl3MixedLinearMethod(LinearMethodBase):
 # sliced by whole 128-column Hadamard blocks); the target still verifies with the full lm_head, so
 # generated text is unchanged. Enabled by EXL3_DRAFT_VOCAB=<draft_vocab.json> (see scripts/draft_vocab.py).
 
+_DRAFT_FAR_FROM = int(os.environ.get("EXL3_DRAFT_FAR_FROM", "2"))
+
+
 def _spec_is_mtp():
     """The pruned draft head only serves the MTP drafter; with another drafter (dspark, dflash) or none it is
     dead weight in VRAM, so skip it."""
@@ -381,7 +395,7 @@ def _spec_is_mtp():
     return sc is not None and "mtp" in str(getattr(sc, "method", "")).lower()
 
 
-def _build_draft_head(layer, path):
+def _build_draft_head(layer, path, attr="exl3_draft"):
     with open(path) as f:
         spec = json.load(f)
     blocks = torch.tensor(spec["blocks"], dtype=torch.long)
@@ -392,11 +406,65 @@ def _build_draft_head(layer, path):
     trellis = layer.trellis.data.index_select(1, tiles).contiguous()
     svh = layer.svh.data.view(-1, 128).index_select(0, blocks.to(dev)).flatten().contiguous()
     idx = (blocks[:, None] * 128 + torch.arange(128)[None, :]).flatten().to(dev)
-    layer.exl3_draft = dict(trellis=trellis, svh=svh, idx=idx,
-                            shard=torch.zeros(len(blocks), dtype=torch.int32, device=dev),
-                            bounds=[0, len(blocks) * 128])
-    logger.info("exl3: MTP draft head uses %d of %d vocab blocks (%.1f%% of lm_head)",
-                len(blocks), n_total_blocks, 100.0 * len(blocks) / n_total_blocks)
+    setattr(layer, attr, dict(trellis=trellis, svh=svh, idx=idx,
+                              shard=torch.zeros(len(blocks), dtype=torch.int32, device=dev),
+                              bounds=[0, len(blocks) * 128]))
+    logger.info("exl3: MTP draft head (%s) uses %d of %d vocab blocks (%.1f%% of lm_head)",
+                attr, len(blocks), n_total_blocks, 100.0 * len(blocks) / n_total_blocks)
+
+
+def _build_draft_q4(layer, d, gs):
+    """DRAFT-Q4: the drafter's compact head as plain int4 (asymmetric, group gs along K)
+    for torch's XPU weight-only int4 GEMV (M=1 65536 x 2048: 126 us at gs 64 vs 228 us for the 6-bit EXL3 slice: the
+    trellis decode is integer-pipe bound). Built from the EXL3 slice itself (identity rows through the same kernel),
+    so it quantizes exactly what the drafter used. Drafter only: the target's lm_head and verify are untouched, so the
+    output is unchanged; only acceptance can move. The EXL3 slice is dropped to give its VRAM back."""
+    from . import ops
+    K = layer.suh.shape[-1]
+    N = d["bounds"][-1]
+    dev = layer.trellis.device
+    wt = torch.empty(K, N, dtype=torch.float16, device=dev)            # W^T: row i = W @ e_i
+    for a in range(0, K, 256):
+        eye = torch.zeros(min(256, K - a), K, dtype=torch.float16, device=dev)
+        eye[torch.arange(eye.shape[0]), torch.arange(a, a + eye.shape[0])] = 1
+        wt[a:a + eye.shape[0]] = torch.ops.exl3xpu_C.linear(eye, d["trellis"], layer.suh, d["svh"], d["shard"],
+                                                             d["bounds"], layer.exl3_K, layer.exl3_cb,
+                                                             ops.SMALL_M_MAX, ops.RECON_SLICE_N)
+    G = K // gs
+    packed = torch.empty(N, K // 8, dtype=torch.int32, device=dev)
+    scales = torch.empty(G, N, dtype=torch.float16, device=dev)
+    zeros = torch.empty(G, N, dtype=torch.int8, device=dev)
+    err = 0.0
+    for a in range(0, N, 8192):
+        w = wt[:, a:a + 8192].t().float().reshape(-1, G, gs)          # [n, G, gs]
+        mn, mx = w.amin(-1, keepdim=True), w.amax(-1, keepdim=True)
+        s = ((mx - mn) / 15).clamp_min(1e-8)
+        z = (-mn / s).round().clamp(0, 15)
+        q = (w / s + z).round().clamp(0, 15)
+        err = max(err, ((q - z) * s - w).abs().amax().item())
+        q = q.reshape(w.shape[0], K).to(torch.uint8)
+        packed[a:a + w.shape[0]] = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous().view(torch.int32)
+        scales[:, a:a + w.shape[0]] = s.squeeze(-1).t().half()
+        zeros[:, a:a + w.shape[0]] = z.squeeze(-1).t().to(torch.int8)
+    del wt
+    d["q4"] = (packed, gs, scales, zeros)
+    if os.environ.get("EXL3_DRAFT_Q4_KEEP", "0") != "1":
+        for key in ("trellis", "svh"):
+            d.pop(key, None)
+    torch.xpu.empty_cache()
+    logger.info("exl3: DRAFT-Q4 head: %d x %d int4, group %d (%.1f MB; max abs dequant err %.2e)",
+                N, K, gs, (packed.numel() * 4 + scales.numel() * 3) / 1e6, err)
+
+
+def draft_sub_logits(lm, d, h):
+    """Compact draft-head logits [M, n_kept]: the int4 head when DRAFT-Q4 built one, else the EXL3 slice."""
+    q = d.get("q4")
+    if q is not None:
+        return torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(h if h.dtype == torch.float16 else h.half(),
+                                                                         q[0], q[1], q[2], q[3])
+    from . import ops
+    return torch.ops.exl3xpu_C.linear(h, d["trellis"], lm.suh, d["svh"], d["shard"], d["bounds"],
+                                      lm.exl3_K, lm.exl3_cb, ops.SMALL_M_MAX, ops.RECON_SLICE_N)
 
 
 def _patch_mtp_draft_logits():
@@ -414,15 +482,37 @@ def _patch_mtp_draft_logits():
         d = getattr(lm, "exl3_draft", None)
         if d is None:
             return orig(self, hidden_states, spec_step_idx)
-        from . import ops
-        sub = torch.ops.exl3xpu_C.linear(hidden_states, d["trellis"], lm.suh, d["svh"], d["shard"], d["bounds"],
-                                         lm.exl3_K, lm.exl3_cb, ops.SMALL_M_MAX, ops.RECON_SLICE_N)
+        far = getattr(lm, "exl3_draft_far", None)
+        if far is not None:
+            k = getattr(self, "_exl3_pass", 0)
+            self._exl3_pass = k + 1
+            if k >= _DRAFT_FAR_FROM:
+                d = far
+        sub = draft_sub_logits(lm, d, hidden_states)   # DRAFT-Q4 int4 head when built
         logits = hidden_states.new_full((hidden_states.shape[0], lm.svh.shape[0]), float("-inf"))
         logits.index_copy_(1, d["idx"], sub)
         return logits[:, : self.config.vocab_size]
 
     cls.compute_logits = compute_logits
     cls._exl3_patched = True
+    if os.environ.get("EXL3_DRAFT_VOCAB_FAR"):
+        try:
+            from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer as _P
+            _orig_propose = _P.propose
+
+            def propose(self, *args, **kwargs):
+                try:
+                    self.model._exl3_pass = 0
+                except Exception:
+                    pass
+                return _orig_propose(self, *args, **kwargs)
+
+            _P.propose = propose
+            logger.info("exl3: graded draft vocab: far head from draft position %d", _DRAFT_FAR_FROM)
+        except Exception as e:  # noqa
+            logger.warning("exl3: graded draft vocab not installed (%s)", e)
+
+
 def _patch_fused_mlp():
     """Decode-batch MLP (3..8 rows) as one exl3xpu op: had_in -> gate_up DPAS -> fused
     had_out(gate, up) + silu*mul + had_in(down) -> down DPAS -> had_out (3 fewer kernels per layer; -9% MLP time in

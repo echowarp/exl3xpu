@@ -67,11 +67,29 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_I4_PREROT` | default (1) | rotate q once per call in a pre-kernel (instead of per split thread) |
 | `EXL3_I4_KVW` | default (1) | I4-KVW: fused int4 KV write (K smoothing + RHT + pack, bit-exact vs vLLM's reshape_and_cache_int4); active with `EXL3_KSMOOTH` |
 | `EXL3_FAST_TOPKP` | default (1) | fused top-k / top-p mask `exl3_topk_topp_mask` (vLLM patch: `topk_topp_sampler.py`) |
+| `EXL3_DRAFT_VOCAB` | 512-block draft vocabulary (see "Data files") | pruned MTP draft head (upstream feature) |
+| `EXL3_DRAFT_VOCAB_FAR` | 128-block draft vocabulary | GRADED-DRAFT: smaller head for draft positions >= `EXL3_DRAFT_FAR_FROM` |
+| `EXL3_DRAFT_FAR_FROM` | 2 | first 0-based draft position that uses the far head |
+| `EXL3_DRAFT_Q4` | 64 | DRAFT-Q4: the draft heads as plain int4 (group size 64) for torch's XPU int4 GEMV; drafter only |
+| `EXL3_DRAFT_Q4_SCOPE` | default (all) | `far`: int4 only for the far head |
+| `EXL3_DRAFT_Q4_KEEP` | default (0) | keep the EXL3 slice next to the int4 head |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
 `num_speculative_tokens_per_batch_size=[[1,4,7],[5,5,5],[6,6,4],[7,8,3],[9,256,2]]` with
 `draft_sample_method=probabilistic` (stock vLLM 0.26 fields).
+
+## Data files you supply
+
+Nothing derived from traffic ships with this fork. The production values above point at files you make yourself:
+
+- **Draft vocabularies** (`EXL3_DRAFT_VOCAB`, `EXL3_DRAFT_VOCAB_FAR`): upstream's generator ranks 128-token vocab
+  blocks by token frequency on a text corpus. Rank on text that looks like your traffic:
+
+      python3 scripts/draft_vocab.py --model <checkpoint> --blocks 512 --text '<your corpus>/*.txt' --out draft-512.json
+      python3 scripts/draft_vocab.py --model <checkpoint> --blocks 128 --text '<your corpus>/*.txt' --out draft-128.json
+
+  `models/qwen3.8-27b-exl3-4.00bpw/draft_vocab.json` (upstream, 256 blocks) works as a generic near head.
 - **K-smoothing table** (`EXL3_KSMOOTH`): run the engine eager (`enforce_eager`) with `EXL3_KSMOOTH_CALIB=ksmooth.pt`
   and the int8 or int4 KV cache over representative prompts; the table (a `{layer: mean[H, D]}` torch file) is
   rewritten after every batch. Then serve with `EXL3_KSMOOTH=ksmooth.pt` (and without `EXL3_KSMOOTH_CALIB`).
