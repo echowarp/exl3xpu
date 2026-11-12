@@ -49,6 +49,16 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_SPEC_VARR` | default (1) | VARR: 4-tile V loads in the int8 verify kernel for >= 2 sequences |
 | `EXL3_SPEC_VARR_MAXL` | 84000 | VARR only for sequences up to this many tokens (in-kernel gate; default 40000) |
 | `EXL3_SPEC_VAT` | default (0) | use the VARR kernel instance with plain loads (register-allocation variant) |
+| `EXL3_INT8KV_FAST` | default (1) | int8 / int4 per-token-head KV: decode, verify and drafter attention on `exl3_spec_attn`, prefill on oneDNN SDPA or block-dequantized FA2 (Triton attention backend) |
+| `EXL3_INT8KV_VARLEN` | default (1) | all requests with <= 8 query rows in one varlen launch, no host sync |
+| `EXL3_I8_SPLITS` | 80,40,64,40 | decode-attention split count per number of requests (entry min(r, N) - 1) |
+| `EXL3_I8_SPLITS_DRAFT` | default (unset = `EXL3_I8_SPLITS`) | split table for the MTP drafter's calls |
+| `EXL3_I8_ONEDNN_MAXLEN` | 60000 | above this many keys, prefill attention uses the chunked FA path (running LSE merge, bounded memory) instead of one oneDNN SDPA call |
+| `EXL3_INT8KV_ONEDNN` | default (1) | oneDNN SDPA for prefill chunks with a prefix |
+| `EXL3_INT8KV_KB` | default (32768) | keys per dequantized FA2 slice |
+| `EXL3_INT8KV_LBUCKET / _QBUCKET` | default (256 / 256) | oneDNN SDPA shape buckets |
+| `EXL3_DRAFT_WIN` | default (0 = off) | DRAFT-WIN: the drafter's attention sees page 0 + the last N tokens (drafts only; output unchanged) |
+| `EXL3_VERIFY16` | default (0) | 9..16-row verify on the decode kernel (split into two pseudo-requests) |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule

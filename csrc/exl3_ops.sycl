@@ -6,6 +6,7 @@
 #include "exl3_esimd.h"
 #include "fa_esimd.h"
 #include "fa_spec_esimd.h"
+#include "fa_prefill_i8.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "norm_sycl.h"
 static int g_norm_wg = 128;
@@ -949,6 +950,150 @@ void exl3_spec_attn_varlen(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache,
     spec_attn_impl(q, k_cache, v_cache, block_table, seqused, out, 8, scale, splits, k_scale, v_scale, &query_start_loc, rot);
 }
 
+// ---- chunk prefill attention straight from the int8_per_token_head cache (fa_prefill_i8.h).
+// q [Lq, Hq, 256] fp16 contiguous (the last Lq of seq_len tokens; their K/V are already in the cache), pages = block
+// ids of the sequence, out rows may be strided. variant: 0 = int8 PV (default), 1 = fp16 PV; nq = query tiles per WG.
+void exl3_i8_prefill_attn(at::Tensor q, at::Tensor kview, at::Tensor pages, int64_t seq_len, double scale, at::Tensor out,
+                          int64_t variant, int64_t nq) {
+    TORCH_CHECK(q.scalar_type() == at::kHalf && q.dim() == 3 && q.size(2) == 256 && q.is_contiguous(), "q [Lq, Hq, 256] fp16");
+    TORCH_CHECK(kview.scalar_type() == at::kChar && kview.dim() == 4 && kview.size(3) == 260 && kview.stride(3) == 1 &&
+                kview.stride(2) == 520 && kview.stride(1) == kview.size(2) * 520 && kview.stride(1) % 16 == 0 &&
+                kview.stride(0) % 64 == 0 && (reinterpret_cast<uintptr_t>(kview.data_ptr()) % 64) == 0,
+                "exl3_i8_prefill_attn: vLLM int8_per_token_head K view [blocks, BS, H, 260]");
+    TORCH_CHECK(kview.size(1) % 64 == 0, "block_size must be a multiple of 64");
+    TORCH_CHECK(pages.scalar_type() == at::kInt && pages.is_contiguous());
+    TORCH_CHECK(out.scalar_type() == at::kHalf && out.size(-1) == 256 && out.stride(-1) == 1);
+    int Lq = q.size(0), Hq = q.size(1), Hk = kview.size(2);
+    TORCH_CHECK(Hq % Hk == 0 && seq_len >= Lq && pages.size(0) * kview.size(1) >= seq_len);
+    if (Lq == 0) return;
+    int G = Hq / Hk;
+    int out_stride = (int)out.stride(0);
+    TORCH_CHECK(out.dim() == 3 ? out.stride(1) == 256 : out.dim() == 2, "out [Lq, Hq, 256] or [Lq, Hq*256] rows");
+    auto& qq = queue_of(q);
+    sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+    auto run = [&](auto kern) {
+        constexpr int NQ = decltype(kern)::NQ_;
+        kern.q = reinterpret_cast<const sycl::half*>(q.data_ptr());
+        kern.kc = reinterpret_cast<const uint8_t*>(kview.data_ptr());
+        kern.pages = pages.data_ptr<int>();
+        kern.out = reinterpret_cast<sycl::half*>(out.data_ptr());
+        kern.Lq = Lq; kern.L = (int)seq_len; kern.Hq = Hq; kern.Hk = Hk; kern.G = G; kern.BS = (int)kview.size(1);
+        kern.out_stride = out_stride; kern.nqt = (Lq + 7) / 8;
+        kern.scale_log2 = (float)(scale * 1.4426950408889634);
+        kern.kbs = (size_t)kview.stride(0); kern.tstride = (int)kview.stride(1); kern.hstride = (int)kview.stride(2);
+        int nqg = (kern.nqt + NQ - 1) / NQ;
+        int wg = NQ * G;
+        qq.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)nqg * Hk * wg, wg), props, kern); });
+    };
+    // variant: 0 = int8 PV, 64-key blocks, lazy rescale (default); 1 = fp16 PV, 32-key; 2 = int8 PV, 32-key, lazy;
+    //          3 = int8 PV, 64-key, eager rescale
+    switch (variant * 4 + (int)nq) {
+        case 0 * 4 + 1: run(exl3fp::FaPrefillI8<1, true, 4, true>{}); break;
+        case 0 * 4 + 2: run(exl3fp::FaPrefillI8<2, true, 4, true>{}); break;
+        case 1 * 4 + 1: run(exl3fp::FaPrefillI8<1, false, 2, true>{}); break;
+        case 1 * 4 + 2: run(exl3fp::FaPrefillI8<2, false, 2, true>{}); break;
+        case 2 * 4 + 1: run(exl3fp::FaPrefillI8<1, true, 2, true>{}); break;
+        case 2 * 4 + 2: run(exl3fp::FaPrefillI8<2, true, 2, true>{}); break;
+        case 3 * 4 + 1: run(exl3fp::FaPrefillI8<1, true, 4, false>{}); break;
+        case 3 * 4 + 2: run(exl3fp::FaPrefillI8<2, true, 4, false>{}); break;
+        default: TORCH_CHECK(false, "exl3_i8_prefill_attn: variant 0..3, nq 1..2");
+    }
+}
+
+// ---- head-major variant for the oneDNN SDPA prefill path: tokens [0, n) of one sequence ->
+// k_out/v_out [H, Lp, 256] fp16 (Lp >= n; rows [n, Lp) are zeroed so padded keys are finite; the causal mask hides them).
+void exl3_i8_gather_dequant_hm(at::Tensor kview, at::Tensor pages, int64_t n, at::Tensor k_out, at::Tensor v_out) {
+    TORCH_CHECK(kview.scalar_type() == at::kChar && kview.dim() == 4 && kview.size(3) == 260 && kview.stride(3) == 1 &&
+                kview.stride(2) == 520, "exl3_i8_gather_dequant_hm: vLLM int8_per_token_head K view [blocks, BS, H, 260]");
+    TORCH_CHECK(pages.scalar_type() == at::kInt && k_out.scalar_type() == at::kHalf && v_out.scalar_type() == at::kHalf);
+    const int64_t H = kview.size(2), BS = kview.size(1);
+    TORCH_CHECK(k_out.is_contiguous() && v_out.is_contiguous() && k_out.dim() == 3 && k_out.size(0) == H && k_out.size(2) == 256 &&
+                v_out.sizes() == k_out.sizes() && k_out.size(1) >= n);
+    const int64_t Lp = k_out.size(1);
+    if (Lp <= 0) return;
+    const int8_t* base = reinterpret_cast<const int8_t*>(kview.data_ptr());
+    const int* pg = pages.data_ptr<int>();
+    const int64_t bstride = kview.stride(0), tstride = kview.stride(1);
+    sycl::half* ko = reinterpret_cast<sycl::half*>(k_out.data_ptr());
+    sycl::half* vo = reinterpret_cast<sycl::half*>(v_out.data_ptr());
+    auto& q = queue_of(kview);
+    const int64_t items = Lp * H * 2 * 16;
+    q.parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+        int64_t i = id[0];
+        int lane = (int)(i % 16); i /= 16;
+        int kv = (int)(i % 2); i /= 2;
+        int h = (int)(i % H); int64_t t = i / H;
+        sycl::half* dst = (kv ? vo : ko) + ((int64_t)h * Lp + t) * 256 + lane * 16;
+        sycl::vec<sycl::half, 16> y;
+        if (t < n) {
+            int64_t blk = pg[t / BS], slot = t % BS;
+            const int8_t* row = base + blk * bstride + slot * tstride + (int64_t)h * 520 + kv * 260;
+            float sc = *reinterpret_cast<const float*>(row + 256);
+            sycl::vec<int8_t, 16> x;
+            x.load(0, sycl::multi_ptr<const int8_t, sycl::access::address_space::global_space>(row + lane * 16));
+            for (int j = 0; j < 16; ++j) y[j] = (sycl::half)((float)x[j] * sc);
+        } else {
+            for (int j = 0; j < 16; ++j) y[j] = (sycl::half)0.0f;
+        }
+        y.store(0, sycl::multi_ptr<sycl::half, sycl::access::address_space::global_space>(dst));
+    });
+}
+
+// ---- fused gather + dequant of vLLM's int8_per_token_head cache (NHD, rows of
+// [K int8 x256 | ks f32 | V int8 x256 | vs f32]) for tokens [start, end) of one sequence -> fp16 K, V [n, H, 256].
+// One work-item per (token, head, K|V); 16-byte loads, fp16 stores. Replaces a 5-kernel torch chain in prefill.
+void exl3_i8_gather_dequant(at::Tensor kview, at::Tensor pages, int64_t start, int64_t end, at::Tensor k_out, at::Tensor v_out) {
+    TORCH_CHECK(kview.scalar_type() == at::kChar && kview.dim() == 4 && kview.size(3) == 260 && kview.stride(3) == 1 &&
+                kview.stride(2) == 520, "exl3_i8_gather_dequant: vLLM int8_per_token_head K view [blocks, BS, H, 260]");
+    TORCH_CHECK(pages.scalar_type() == at::kInt && k_out.scalar_type() == at::kHalf && v_out.scalar_type() == at::kHalf);
+    const int64_t n = end - start, H = kview.size(2), BS = kview.size(1);
+    TORCH_CHECK(k_out.is_contiguous() && v_out.is_contiguous() && k_out.numel() >= n * H * 256 && v_out.numel() >= n * H * 256);
+    if (n <= 0) return;
+    const int8_t* base = reinterpret_cast<const int8_t*>(kview.data_ptr());
+    const int* pg = pages.data_ptr<int>();
+    const int64_t bstride = kview.stride(0), tstride = kview.stride(1);
+    sycl::half* ko = reinterpret_cast<sycl::half*>(k_out.data_ptr());
+    sycl::half* vo = reinterpret_cast<sycl::half*>(v_out.data_ptr());
+    auto& q = queue_of(kview);
+    const int64_t items = n * H * 2 * 16;           // 16 work-items per (token, head, K|V) row: 16 bytes each
+    q.parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+        int64_t i = id[0];
+        int lane = (int)(i % 16); i /= 16;
+        int kv = (int)(i % 2); i /= 2;
+        int h = (int)(i % H); int64_t t = i / H;
+        int64_t tok = start + t;
+        int64_t blk = pg[tok / BS], slot = tok % BS;
+        const int8_t* row = base + blk * bstride + slot * tstride + (int64_t)h * 520 + kv * 260;
+        float sc = *reinterpret_cast<const float*>(row + 256);
+        sycl::vec<int8_t, 16> x;
+        x.load(0, sycl::multi_ptr<const int8_t, sycl::access::address_space::global_space>(row + lane * 16));
+        sycl::vec<sycl::half, 16> y;
+        for (int j = 0; j < 16; ++j) y[j] = (sycl::half)((float)x[j] * sc);
+        sycl::half* dst = (kv ? vo : ko) + (t * H + h) * 256 + lane * 16;
+        y.store(0, sycl::multi_ptr<sycl::half, sycl::access::address_space::global_space>(dst));
+    });
+}
+
+// ---- debug: one int8 DPAS with the layouts FaSpecKernelT<2> uses.
+// A [8, 32] int8 row-major; Bw [8, 16] int32 = VNNI dwords (4 consecutive k of one column n); C [8, 16] int32.
+struct DpasI8Probe {
+    const int8_t* a; const uint32_t* bw; int* c;
+    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        using namespace sycl::ext::intel::esimd;
+        namespace xmx = sycl::ext::intel::esimd::xmx;
+        simd<int8_t, 256> av = block_load<int8_t, 256>(a);
+        simd<uint32_t, 128> bv = block_load<uint32_t, 128>(bw);
+        simd<int, 128> acc = 0;
+        acc = xmx::dpas<8, 8, int, int, int8_t, int8_t>(acc, bv.template bit_cast_view<int8_t>().read(), av);
+        block_store<int, 128>(c, acc);
+    }
+};
+void exl3_dpas_i8_probe(at::Tensor a, at::Tensor bw, at::Tensor c) {
+    auto& q = queue_of(a);
+    DpasI8Probe k{reinterpret_cast<const int8_t*>(a.data_ptr()), reinterpret_cast<const uint32_t*>(bw.data_ptr()), c.data_ptr<int>()};
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(1, 1), k); });
+}
+
 // ---- diagnostic: stream the trellis with exactly the MB=8 DPAS thread mapping (strip of NT tiles x K split),
 // no decode, no DPAS: an xor-reduce per thread. Tells whether the access pattern + static split partition can
 // reach the DRAM ceiling on their own.
@@ -1333,6 +1478,14 @@ TORCH_LIBRARY(exl3xpu_C, m) {
 #ifdef EXL3_DNNL
     m.def("exl3_set_mlp_mid_q8(int on) -> ()", &exl3_set_mlp_mid_q8);
     m.def("exl3_set_q8_fold(int on) -> ()", &exl3_set_q8_fold);
+    m.def("exl3_dpas_i8_probe(Tensor a, Tensor bw, Tensor(a!) c) -> ()");
+    m.def("exl3_i8_gather_dequant(Tensor kview, Tensor pages, int start, int end, Tensor(a!) k_out, Tensor(b!) v_out) -> ()");
+    m.impl("exl3_i8_gather_dequant", torch::kXPU, &exl3_i8_gather_dequant);
+    m.def("exl3_i8_gather_dequant_hm(Tensor kview, Tensor pages, int n, Tensor(a!) k_out, Tensor(b!) v_out) -> ()");
+    m.impl("exl3_i8_gather_dequant_hm", torch::kXPU, &exl3_i8_gather_dequant_hm);
+    m.def("exl3_i8_prefill_attn(Tensor q, Tensor kview, Tensor pages, int seq_len, float scale, Tensor(a!) out, int variant=0, int nq=2) -> ()");
+    m.impl("exl3_i8_prefill_attn", torch::kXPU, &exl3_i8_prefill_attn);
+    m.impl("exl3_dpas_i8_probe", torch::kXPU, &exl3_dpas_i8_probe);
 #endif
 #ifdef EXL3_DNNL
     m.def("exl3_sdpa(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");

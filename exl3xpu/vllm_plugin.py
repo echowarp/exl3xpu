@@ -5,6 +5,7 @@ Registered via the `vllm.general_plugins` entry point, so every vLLM process (AP
 engine core, workers) imports it before model construction.
 """
 from __future__ import annotations
+import copy
 import json
 import os
 import re
@@ -502,12 +503,284 @@ def _patch_fast_norm():
     logger.info("exl3: fast fused add+RMSNorm enabled (decode batches)")
 
 
+# ---- int8_per_token_head KV cache at fp16-or-better speed (vLLM's Triton backend layout and
+# write path; attention compute replaced). Uniform decode / spec-verify batches (q_len <= 8, incl. the MTP drafter's
+# q_len 1) -> exl3_spec_attn int8 kernel (int8 Q.K and P.V on XMX, per-token scales inline in the cache rows).
+# Prefill / mixed batches -> per request: q_len <= 8 -> the same kernel; longer -> block-dequantized fp16 FA2 with a
+# log-sum-exp merge (as exl3xpu.fp8kv_prefill). Env EXL3_INT8KV_FAST=0 keeps vLLM's Triton kernels.
+_I8_KB = int(os.environ.get("EXL3_INT8KV_KB", "32768"))
+
+
+def _i8_gather_dequant(cache, pages, bs, start, end):
+    """cache: vLLM per-token-head view [blocks, BS, H, 260] int8 (data 0..255, f32 scale at 256..259)
+    -> fp16 [end-start, H, 256]."""
+    p0, p1 = start // bs, (end + bs - 1) // bs
+    blk = cache.index_select(0, pages[p0:p1]).flatten(0, 1)
+    off = start - p0 * bs
+    x = blk[off: off + (end - start)]
+    sc = x[..., 256:260].contiguous().view(torch.float32)              # [n, H, 1]
+    return (x[..., :256].to(torch.float32) * sc).to(torch.float16)
+
+
+def _i8_fa(q, k, v, causal, scale):
+    from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+    Q, L = q.shape[0], k.shape[0]
+    cq = torch.tensor([0, Q], dtype=torch.int32, device=q.device)
+    ck = torch.tensor([0, L], dtype=torch.int32, device=q.device)
+    return flash_attn_varlen_func(q, k, v, Q, cq, L, cu_seqlens_k=ck, causal=causal,
+                                  softmax_scale=scale, return_softmax_lse=True)
+
+
+def _i8_kv(key_cache, value_cache, pages, bs, s0, e0):
+    """fp16 K, V [e0-s0, H, 256] for tokens [s0, e0): one fused SYCL gather+dequant (torch chain as fallback)."""
+    E = getattr(torch.ops, "exl3xpu_C", None)
+    if E is not None and hasattr(E, "exl3_i8_gather_dequant"):
+        H = key_cache.shape[2]
+        k = torch.empty((e0 - s0, H, 256), dtype=torch.float16, device=key_cache.device)
+        v = torch.empty_like(k)
+        E.exl3_i8_gather_dequant(key_cache, pages, s0, e0, k, v)
+        return k, v
+    return _i8_gather_dequant(key_cache, pages, bs, s0, e0), _i8_gather_dequant(value_cache, pages, bs, s0, e0)
+
+
+_I8_ONEDNN = os.environ.get("EXL3_INT8KV_ONEDNN", "1") == "1"
+_I8_LBUCKET = int(os.environ.get("EXL3_INT8KV_LBUCKET", "256"))   # key length bucket (compiled shapes)
+_I8_QBUCKET = int(os.environ.get("EXL3_INT8KV_QBUCKET", "256"))
+
+
+def _i8_prefill_onednn(E, q, key_cache, pages, seq_len, scale, out):
+    """One oneDNN Graph fused SDPA call per layer (upstream EXL3_ONEDNN_ATTN idea, here for the
+    int8 cache): K/V gathered + dequantized head-major [Hk, Lp, 256] (keys padded to a bucket, zeros), queries
+    head-major [Hq, Qp, 256] padded at the top; causal bottom-right with the real lengths (len_k = seq_len,
+    len_q = Qp) so the padded keys are masked and the padded query rows are discarded. GQA natively (Hq = G*Hk):
+    K/V read once per group, 1.18-1.26x cutlass FA2 at 3k-60k (microbenchmark)."""
+    Q, Hq, D = q.shape
+    Hk = key_cache.shape[2]
+    # The fused kernel aligns the causal mask by the tensor shapes (row r sees cols <= r + Lp - Qp), not by the
+    # len scalars. Keys padded at the end by b = Lp - seq_len are therefore balanced by b padding query rows at the
+    # BOTTOM: real query j sits at row a + j and sees keys <= seq_len - Q + j exactly; the padding keys are visible
+    # only to the discarded bottom rows. Bucketing (Lp, Qp) keeps the set of compiled shapes small (~0.7 s each, once).
+    Lp = (seq_len + _I8_LBUCKET - 1) // _I8_LBUCKET * _I8_LBUCKET
+    b = Lp - seq_len
+    Qp = (Q + b + _I8_QBUCKET - 1) // _I8_QBUCKET * _I8_QBUCKET
+    a = Qp - Q - b
+    kb = torch.empty((Hk, Lp, D), dtype=torch.float16, device=q.device)
+    vb = torch.empty_like(kb)
+    E.exl3_i8_gather_dequant_hm(key_cache, pages, seq_len, kb, vb)
+    qg = torch.zeros((Hq, Qp, D), dtype=torch.float16, device=q.device)
+    qg[:, a:a + Q].copy_(q.permute(1, 0, 2))
+    og = torch.empty_like(qg)
+    E.exl3_sdpa_len(qg, kb, vb, og, _I8_NONE.setdefault(q.device, torch.empty(0, device=q.device)), True, scale,
+                    Lp, Qp)
+    out.copy_(og[:, a:a + Q].permute(1, 0, 2))
+    return out
+
+
+_I8_NONE = {}
+
+
+# 262k context: the oneDNN path dequantizes the WHOLE K/V history to fp16 per layer call (~4 KB/token:
+# ~530 MB at 129k), which overran the VRAM headroom at gpu_memory_utilization 0.965 (a test engine died at ~129k with
+# UR_RESULT_ERROR_OUT_OF_RESOURCES). Above EXL3_I8_ONEDNN_MAXLEN keys (0 = no limit) prefill attention takes the chunked
+# FA path below: _I8_KB-key slices (128 MB at 32k), LSE merge, bounded memory.
+_I8_ONEDNN_MAXLEN = int(os.environ.get("EXL3_I8_ONEDNN_MAXLEN", "0"))
+_I8_LONG_SEEN = []
+
+
+def _i8_prefill(q, key_cache, value_cache, pages, seq_len, scale, out):
+    if _I8_ONEDNN_MAXLEN and seq_len > _I8_ONEDNN_MAXLEN and not _I8_LONG_SEEN:
+        _I8_LONG_SEEN.append(1); logger.info("exl3: I8-LONG-PREFILL chunked FA path above %d keys (first: %d)", _I8_ONEDNN_MAXLEN, seq_len)
+    if _I8_ONEDNN and seq_len > q.shape[0] and not (_I8_ONEDNN_MAXLEN and seq_len > _I8_ONEDNN_MAXLEN):   # chunks with a prefix (a lone first chunk is faster on FA2: 0.81x)
+        E = getattr(torch.ops, "exl3xpu_C", None)
+        if E is not None and hasattr(E, "exl3_sdpa_len") and hasattr(E, "exl3_i8_gather_dequant_hm"):
+            return _i8_prefill_onednn(E, q, key_cache, pages.to(torch.int32), seq_len, scale, out)
+    Q, bs = q.shape[0], key_cache.shape[1]
+    prefix = seq_len - Q
+    parts = []
+    pages = pages.to(torch.int32)
+    if _I8_ONEDNN_MAXLEN and seq_len > _I8_ONEDNN_MAXLEN:
+        # long context: running LSE merge (one fp32 accumulator), memory independent of the number of key slices
+        acc = m = den = None
+        spans = [(s0, min(s0 + _I8_KB, prefix), False) for s0 in range(0, prefix, _I8_KB)] + [(prefix, seq_len, True)]
+        for s0, e0, causal in spans:
+            o, lse = _i8_fa(q, *_i8_kv(key_cache, value_cache, pages, bs, s0, e0), causal, scale)[:2]
+            lse = lse.float()                                      # [Q, Hq] (as the stacked merge below uses it)
+            if acc is None:
+                acc, m, den = o.float(), lse, torch.ones_like(lse)
+                continue
+            m2 = torch.maximum(m, lse)
+            a1, a2 = torch.exp(m - m2), torch.exp(lse - m2)
+            acc.mul_(a1.unsqueeze(-1)).add_(o.float() * a2.unsqueeze(-1))
+            den = den * a1 + a2
+            m = m2
+            del o
+        out.copy_((acc / den.unsqueeze(-1)).to(out.dtype))
+        return out
+    for s0 in range(0, prefix, _I8_KB):
+        e0 = min(s0 + _I8_KB, prefix)
+        parts.append(_i8_fa(q, *_i8_kv(key_cache, value_cache, pages, bs, s0, e0), False, scale))
+    parts.append(_i8_fa(q, *_i8_kv(key_cache, value_cache, pages, bs, prefix, seq_len), True, scale))
+    if len(parts) == 1:
+        out.copy_(parts[0][0])
+        return out
+    lses = torch.stack([pp[1] for pp in parts])
+    m = lses.amax(0)
+    w = torch.exp(lses - m)
+    num = sum(pp[0].float() * wi.unsqueeze(-1) for pp, wi in zip(parts, w))
+    out.copy_((num / w.sum(0).unsqueeze(-1)).to(out.dtype))
+    return out
+
+
+
+# graph-replay sweep: int8 decode-attention split count per batch size.
+# EXL3_I8_SPLITS="s1,s2,...,sN": request count r uses entry min(r, N) - 1. Default = the old fixed rule (64 at 1, 32 at >= 2).
+_I8_SPLITS = [int(x) for x in os.environ.get("EXL3_I8_SPLITS", "64,32").split(",") if x.strip()]
+
+
+def _i8_splits(nr):
+    return _I8_SPLITS[min(nr, len(_I8_SPLITS)) - 1]
+
+
+
+# optional split table for the MTP drafter's 1-row calls (EXL3_I8_SPLITS_DRAFT;
+# unset = the verify table)
+_I8_SPLITS_DRAFT = [int(x) for x in os.environ.get("EXL3_I8_SPLITS_DRAFT", "").split(",") if x.strip()]
+
+
+def _i8_splits_for(nr, draft):
+    if draft and _I8_SPLITS_DRAFT:
+        return _I8_SPLITS_DRAFT[min(nr, len(_I8_SPLITS_DRAFT)) - 1]
+    return _i8_splits(nr)
+
+
+def _patch_int8kv_fast():
+    if os.environ.get("EXL3_INT8KV_FAST", "1") != "1":
+        return
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+        from vllm.v1.kv_cache_interface import KVQuantMode
+    except Exception as e:  # noqa
+        logger.warning("exl3: int8 KV fast path not installed (%s)", e)
+        return
+    if getattr(TritonAttentionImpl, "_exl3_i8_patched", False):
+        return
+    E = getattr(torch.ops, "exl3xpu_C", None)
+    if E is None or not hasattr(E, "exl3_spec_attn"):
+        logger.warning("exl3: int8 KV fast path needs exl3_spec_attn; not installed")
+        return
+    orig = TritonAttentionImpl.forward
+    _HAS_VARLEN = hasattr(E, "exl3_spec_attn_varlen") and os.environ.get("EXL3_INT8KV_VARLEN", "1") == "1"
+    _VERIFY16 = os.environ.get("EXL3_VERIFY16", "0") == "1"
+    # DRAFT-WIN (long-context decode): the MTP drafter's decode-time attention (<= 8 query rows
+    # per request) sees page 0 (attention-sink tokens: system prompt start) + the last ceil(EXL3_DRAFT_WIN / block) pages
+    # instead of the whole context. RoPE is already in the cached K, so a shortened block-table view + seq_len is exact
+    # windowed attention (keys renumbered, causality kept). Device-only, fixed shapes (graph-safe). Drafts only: the
+    # target's verify attention is untouched, so outputs stay exact; acceptance may change. 0 = off.
+    _DWIN = int(os.environ.get("EXL3_DRAFT_WIN", "0") or 0)
+    _DWIN_LOGGED = []
+
+    def _dwin_view(bt, sl, bs):
+        nw = (_DWIN + bs - 1) // bs
+        npg = bt.shape[1]
+        if npg < nw + 2:
+            return bt, sl
+        sl = sl.to(torch.int32)
+        lastp = (sl - 1).clamp(min=0) // bs
+        p0 = (lastp - nw + 1).clamp(min=1)
+        idx = (p0[:, None] + torch.arange(nw, device=bt.device, dtype=p0.dtype)[None, :]).clamp(max=npg - 1).long()
+        win = torch.cat([bt[:, :1], torch.gather(bt, 1, idx)], 1)
+        use = lastp > nw
+        bt2 = torch.where(use[:, None], win, bt[:, : nw + 1]).contiguous()
+        sl2 = torch.where(use, sl - (p0 - 1) * bs, sl).contiguous()
+        return bt2, sl2
+
+    _FAST_MODES = (KVQuantMode.INT8_PER_TOKEN_HEAD,)
+
+    def _fwd8(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None,
+              output_block_scale=None, rot=None):
+        if (attn_metadata is None or not getattr(self, "_is_per_token_head_quant", False)
+                or self._kv_quant_mode not in _FAST_MODES or self.head_size != 256
+                or output_scale is not None or output_block_scale is not None
+                or getattr(self, "sliding_window", None) not in (None, (-1, -1))):
+            return orig(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale,
+                        output_block_scale)
+        key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        md = attn_metadata
+        T = md.num_actual_tokens
+        nr = md.query_start_loc.shape[0] - 1
+        mq = md.max_query_len
+        _is_draft = "mtp" in str(getattr(layer, "layer_name", ""))
+        if _DWIN and mq <= 8 and _is_draft:
+            bt2, sl2 = _dwin_view(md.block_table[:nr], md.seq_lens[:nr], key_cache.shape[1])
+            if not _DWIN_LOGGED:
+                _DWIN_LOGGED.append(1)
+                logger.info("exl3: DRAFT-WIN on: drafter attention = page 0 + last %d tokens (layer %s)", _DWIN,
+                            getattr(layer, "layer_name", "?"))
+            md = copy.copy(md)
+            md.block_table, md.seq_lens = bt2, sl2
+        H = self.num_heads
+        q = query.view(-1, H, 256)
+        out = output.view(-1, H, 256)
+        # uniform decode/spec batch; under FULL graphs the batch is padded (q has nr*mq rows, padded requests have
+        # seq_len 0 -> the kernel writes zeros), so accept either form; never host-sync on this path
+        if mq <= 8 and (T == nr * mq or q.shape[0] == nr * mq):
+            n = nr * mq
+            E.exl3_spec_attn(q[:n], key_cache, value_cache, md.block_table[:nr], md.seq_lens[:nr], out[:n], mq,
+                             float(self.scale), _i8_splits_for(nr, _is_draft), None, None, rot)
+            return output
+        # varlen: every request with <= 8 query rows (decode / spec verify / the MTP drafter's first pass after
+        # different acceptance counts) in ONE launch, no host sync (the old per-request loop
+        # synced the GPU each step at >= 2 streams); only requests with > 8 rows (prefill chunks) go per request
+        qsl_d = md.query_start_loc[: nr + 1]
+        # VERIFY-16: 9..16 query rows per request (long lookup-chain verify,
+        # the MTP drafter's first pass after it) without the prefill path: each request is split on the device into two
+        # pseudo-requests sharing its block table, rows [0, 8) with seq_len - (rows after them) and the rest with seq_len;
+        # the kernel's causal limit (seq_len - q_len + row) then equals the original one for every row. No host sync.
+        assert rot is None or mq <= 8, "I4-ROT: only for <= 8 query rows"
+        if _HAS_VARLEN and 8 < mq <= 16 and _VERIFY16:
+            qi = qsl_d if qsl_d.dtype == torch.int32 else qsl_d.to(torch.int32)
+            st, ql = qi[:-1], qi[1:] - qi[:-1]
+            first = ql.clamp(max=8)
+            sl = md.seq_lens[:nr].to(torch.int32)
+            qsl2 = torch.cat([torch.stack([st, st + first], 1).flatten(), qi[-1:]]).contiguous()
+            sl2 = torch.stack([sl - (ql - first), sl], 1).flatten().contiguous()
+            bt2 = md.block_table[:nr].repeat_interleave(2, dim=0)
+            E.exl3_spec_attn_varlen(q, key_cache, value_cache, bt2, sl2, qsl2, out, float(self.scale), 32)
+            return output
+        if _HAS_VARLEN:
+            E.exl3_spec_attn_varlen(q, key_cache, value_cache, md.block_table[:nr], md.seq_lens[:nr],
+                                    qsl_d if qsl_d.dtype == torch.int32 else qsl_d.to(torch.int32), out,
+                                    float(self.scale), _i8_splits_for(nr, _is_draft), None, None, rot)
+            if mq <= 8:
+                return output
+        qsl = qsl_d.cpu().tolist()
+        sl = md.seq_lens[:nr].cpu().tolist()
+        for i in range(nr):
+            a, b = qsl[i], qsl[i + 1]
+            ql = b - a
+            if ql <= 0:
+                continue
+            if ql <= 8:
+                if not _HAS_VARLEN:
+                    E.exl3_spec_attn(q[a:b], key_cache, value_cache, md.block_table[i: i + 1], md.seq_lens[i: i + 1],
+                                     out[a:b], ql, float(self.scale), 64)
+            else:
+                _i8_prefill(q[a:b], key_cache, value_cache, md.block_table[i], sl[i], float(self.scale), out[a:b])
+        return output
+
+    TritonAttentionImpl.forward = _fwd8
+    TritonAttentionImpl._exl3_i8_patched = True
+
+    logger.info("exl3: int8_per_token_head KV: exl3 int8 decode kernel + block-dequantized FA2 prefill")
+
+
 
 
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     _patch_fused_mlp()
     _patch_fast_norm()
+    _patch_int8kv_fast()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()
     if os.environ.get("EXL3_VLLM_PATCHES", "1") != "0":
