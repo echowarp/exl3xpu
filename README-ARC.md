@@ -22,6 +22,7 @@ production engine loads those only through vLLM's `kv_transfer_config` (Offloadi
 Production toolchain: Intel oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319), oneDNN 3.9.1, PyTorch
 2.12.0+xpu (all from `intel/llm-scaler-vllm:0.26.0-b2`, the upstream base image) with the GPU runtime upgraded to
 compute-runtime (NEO) 26.31 / IGC 2.40 / Level Zero 1.32. All libraries are JIT builds (`-fsycl-targets=spir64`).
+`docker/Dockerfile.arc` is a recipe for such an image.
 
 | Library | Source | Flags | Provenance of the flags |
 |---|---|---|---|
@@ -29,8 +30,8 @@ compute-runtime (NEO) 26.31 / IGC 2.40 / Level Zero 1.32. All libraries are JIT 
 | `exl3xpu/gdnchunk.so` | `gdnchunk/csrc/gdn_chunk_ops.sycl` | `-O3 -ffast-math -fsycl-device-code-split=per_kernel -DGDNC_PF=1 -DGDNC_PF_DIST=2 -DGDNC_PF_QK256=1 -DGDNC_CONV2=1 -DGDNC_VNNI2D=1 -DGDNC_PLANPAR=1 -DGDNC_CONV_VEC=4` | Documented with the production build when it was made; the binary itself carries no record. Not verified by a rebuild. |
 | `exl3xpu/ng.so` | `ng/ng_ops.sycl` | `-O3` (no `-ffast-math`), no `-D` options | The recorded build command. Not verified by a rebuild. |
 
-Nothing here reproduces the production binaries byte for byte; rebuild and run the tests in `tests/` before relying
-on a build.
+Nothing here reproduces the production binaries byte for byte; rebuild and run the tests in `tests/` and `tests/arc/`
+before relying on a build.
 
 ## Environment variables
 
@@ -141,4 +142,6 @@ Nothing derived from traffic ships with this fork. The production values above p
 | `exl3xpu/lazyvis.py` | lazy vision tower |
 | `exl3xpu/nommap_loader.py` | weight loading without mmap |
 | `tools/oor/` | torch XPU allocator cap + statistics (`.pth`-loaded) |
+| `tests/arc/` | int4/int8 decode-attention and KV-write kernel tests and microbenchmarks (synthetic tensors) |
+| `docker/Dockerfile.arc` | image with the newer GPU runtime and this fork's libraries |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |
