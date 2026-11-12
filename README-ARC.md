@@ -63,6 +63,9 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_KSMOOTH_CALIB` | unset | calibration: accumulate key means of the traffic (eager engine) and save the table to this path |
 | `EXL3_KSMOOTH_CALIB_EVERY` | default (1) | save the table every N batches |
 | `EXL3_KSMOOTH_ROBUST` | default (1) | calibration ignores token-heads with key norm > 3x the median (attention sinks) |
+| `EXL3_I4_ROT` | default (1) | int4 KV: q / output rotation (vLLM's RHT) inside the decode kernels instead of host matmuls |
+| `EXL3_I4_PREROT` | default (1) | rotate q once per call in a pre-kernel (instead of per split thread) |
+| `EXL3_I4_KVW` | default (1) | I4-KVW: fused int4 KV write (K smoothing + RHT + pack, bit-exact vs vLLM's reshape_and_cache_int4); active with `EXL3_KSMOOTH` |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule

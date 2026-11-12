@@ -534,6 +534,12 @@ def _i8_fa(q, k, v, causal, scale):
 def _i8_kv(key_cache, value_cache, pages, bs, s0, e0):
     """fp16 K, V [e0-s0, H, 256] for tokens [s0, e0): one fused SYCL gather+dequant (torch chain as fallback)."""
     E = getattr(torch.ops, "exl3xpu_C", None)
+    if E is not None and key_cache.dtype == torch.uint8:   # int4_per_token_head (rotated space)
+        H = key_cache.shape[2]
+        k = torch.empty((e0 - s0, H, 256), dtype=torch.float16, device=key_cache.device)
+        v = torch.empty_like(k)
+        E.exl3_i4_gather_dequant(key_cache, pages, s0, e0, k, v)
+        return k, v
     if E is not None and hasattr(E, "exl3_i8_gather_dequant"):
         H = key_cache.shape[2]
         k = torch.empty((e0 - s0, H, 256), dtype=torch.float16, device=key_cache.device)
@@ -566,7 +572,7 @@ def _i8_prefill_onednn(E, q, key_cache, pages, seq_len, scale, out):
     a = Qp - Q - b
     kb = torch.empty((Hk, Lp, D), dtype=torch.float16, device=q.device)
     vb = torch.empty_like(kb)
-    E.exl3_i8_gather_dequant_hm(key_cache, pages, seq_len, kb, vb)
+    (E.exl3_i4_gather_dequant_hm if key_cache.dtype == torch.uint8 else E.exl3_i8_gather_dequant_hm)(key_cache, pages, seq_len, kb, vb)
     qg = torch.zeros((Hq, Qp, D), dtype=torch.float16, device=q.device)
     qg[:, a:a + Q].copy_(q.permute(1, 0, 2))
     og = torch.empty_like(qg)
@@ -641,6 +647,11 @@ def _i8_splits(nr):
     return _I8_SPLITS[min(nr, len(_I8_SPLITS)) - 1]
 
 
+# int4 KV: vLLM's int4_per_token_head stores K, V rotated by its unnormalised RHT (H D x, H = 256x256
+# Sylvester Hadamard, D = its fixed signs): k_r = 16 R k with R = Hn D orthonormal. q' = q R^T / 16 = q M / 16 gives
+# q'.k_r = q.k; the output o_r = 16 R o -> o = o_r M^T / 16 (M = D Hn). One small matmul each (graph-safe).
+_I4_M = {}
+
 
 # optional split table for the MTP drafter's 1-row calls (EXL3_I8_SPLITS_DRAFT;
 # unset = the verify table)
@@ -651,6 +662,54 @@ def _i8_splits_for(nr, draft):
     if draft and _I8_SPLITS_DRAFT:
         return _I8_SPLITS_DRAFT[min(nr, len(_I8_SPLITS_DRAFT)) - 1]
     return _i8_splits(nr)
+
+
+_I4_S = {}
+# I4-ROT: the .so takes the RHT signs (rot=) and rotates in-kernel; EXL3_I4_ROT=0: host matmuls
+_I4_ROT_OK = []
+_I4_KVW_OK = []
+
+
+def _i4_kvw():
+    if not _I4_KVW_OK:
+        ok = os.environ.get("EXL3_I4_KVW", "1") == "1" and hasattr(getattr(torch.ops, "exl3xpu_C", None), "exl3_i4_kv_write")
+        _I4_KVW_OK.append(ok)
+        logger.info("exl3: I4-KVW (fused int4 KV write) %s", "on" if ok else "off")
+    return _I4_KVW_OK[0]
+
+
+def _i4_rot():
+    if not _I4_ROT_OK:
+        ok = False
+        if os.environ.get("EXL3_I4_ROT", "1") == "1":
+            try:
+                ok = "rot" in [x.name for x in torch.ops.exl3xpu_C.exl3_spec_attn.default._schema.arguments]
+            except Exception:  # noqa: BLE001
+                ok = False
+        _I4_ROT_OK.append(ok)
+        logger.info("exl3: I4-ROT (int4 q/output rotation in the decode kernels) %s", "on" if ok else "off")
+    return _I4_ROT_OK[0]
+
+
+def _i4_signs(dev):
+    s = _I4_S.get(dev)
+    if s is None:
+        from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
+        s = _I4_S[dev] = _get_rht_signs(256, 0, torch.device("cpu")).float().contiguous().to(dev)
+    return s
+
+
+def _i4_m(dev):
+    m = _I4_M.get(dev)
+    if m is None:
+        from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
+        h = torch.ones(1, 1, dtype=torch.float32)
+        while h.shape[0] < 256:
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+        sg = _get_rht_signs(256, 0, torch.device("cpu")).float()
+        m = (sg[:, None] * (h / 16.0)).to(dev)              # M = D Hn  (rows scaled by the signs)
+        _I4_M[dev] = m = (m / 16.0, m.t().contiguous() / 16.0)
+    return m
 
 
 def _patch_int8kv_fast():
@@ -694,7 +753,27 @@ def _patch_int8kv_fast():
         sl2 = torch.where(use, sl - (p0 - 1) * bs, sl).contiguous()
         return bt2, sl2
 
-    _FAST_MODES = (KVQuantMode.INT8_PER_TOKEN_HEAD,)
+    _FAST_MODES = (KVQuantMode.INT8_PER_TOKEN_HEAD,) + (
+        (KVQuantMode.INT4_PER_TOKEN_HEAD,) if hasattr(KVQuantMode, "INT4_PER_TOKEN_HEAD") and hasattr(E, "exl3_i4_gather_dequant") else ())
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None,
+                output_block_scale=None):
+        if (attn_metadata is not None and getattr(self, "_is_per_token_head_quant", False)
+                and self._kv_quant_mode != KVQuantMode.INT8_PER_TOKEN_HEAD and self._kv_quant_mode in _FAST_MODES
+                and self.head_size == 256 and output_scale is None and output_block_scale is None):
+            # int4: attend in vLLM's rotated space (q in, output back); the KV write path is vLLM's own
+            H = self.num_heads
+            # decode / verify / drafter steps (every request <= 8 query rows, so only the
+            # exl3_spec_attn kernels run) rotate q and the output inside the kernels (no fp32 matmuls, casts, copies)
+            if attn_metadata.max_query_len <= 8 and _i4_rot():
+                return _fwd8(self, layer, query, key, value, kv_cache, attn_metadata, output, rot=_i4_signs(query.device))
+            fm, bm = _i4_m(query.device)
+            q_r = (query.view(-1, H, 256).float() @ fm).to(query.dtype)
+            o_r = torch.empty_like(output.view(-1, H, 256))
+            _fwd8(self, layer, q_r, key, value, kv_cache, attn_metadata, o_r)
+            output.view(-1, H, 256).copy_((o_r.float() @ bm).to(output.dtype))
+            return output
+        return _fwd8(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale, output_block_scale)
 
     def _fwd8(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None,
               output_block_scale=None, rot=None):
@@ -768,7 +847,7 @@ def _patch_int8kv_fast():
                 _i8_prefill(q[a:b], key_cache, value_cache, md.block_table[i], sl[i], float(self.scale), out[a:b])
         return output
 
-    TritonAttentionImpl.forward = _fwd8
+    TritonAttentionImpl.forward = forward
     TritonAttentionImpl._exl3_i8_patched = True
 
     # K smoothing (SageAttention): store K - m (per layer / kv head / channel constant). Q.(K - m) = Q.K - Q.m and Q.m is
@@ -789,7 +868,7 @@ def _patch_int8kv_fast():
 
         def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
             name = getattr(layer, "layer_name", None)
-            if (getattr(self, "_kv_quant_mode", None) == KVQuantMode.INT8_PER_TOKEN_HEAD
+            if (getattr(self, "_kv_quant_mode", None) in (KVQuantMode.INT8_PER_TOKEN_HEAD, getattr(KVQuantMode, "INT4_PER_TOKEN_HEAD", None))
                     and name is not None):
                 if cal_path:
                     valid = slot_mapping[: key.shape[0]] >= 0
@@ -815,6 +894,18 @@ def _patch_int8kv_fast():
                         cal["n"] += 1
                         if cal["n"] % int(os.environ.get("EXL3_KSMOOTH_CALIB_EVERY", "1")) == 0:   # every batch (a larger interval lost the tail)
                             torch.save({k: (v[0] / v[1].clamp_min(1).unsqueeze(-1)).float() for k, v in cal.items() if k != "n"}, cal_path)
+                # I4-KVW: int4 writes in one fused kernel (K smoothing + RHT + pack; bit-exact vs
+                # vLLM's reshape_and_cache_int4, whose single_rht runs as a PyTorch butterfly on XPU). EXL3_I4_KVW=0: off
+                if (self._kv_quant_mode == getattr(KVQuantMode, "INT4_PER_TOKEN_HEAD", None)
+                        and key.dim() == 3 and key.shape[-1] == 256 and key.dtype == torch.float16 and _i4_kvw()):
+                    mf = None
+                    if name in kmeans:
+                        mf = getattr(self, "_exl3_kmf", None)
+                        if mf is None or mf.device != key.device:
+                            mf = self._exl3_kmf = kmeans[name].to(device=key.device, dtype=torch.float32).contiguous()
+                    key_cache, _vc = self._pth_key_value_caches(kv_cache)
+                    torch.ops.exl3xpu_C.exl3_i4_kv_write(key, value, key_cache, slot_mapping, _i4_signs(key.device), mf)
+                    return
                 if name in kmeans:
                     m = getattr(self, "_exl3_km", None)
                     if m is None or m.device != key.device:
