@@ -7,7 +7,7 @@
 # Toolchain of the production build: Intel oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319), oneDNN 3.9.1,
 # PyTorch 2.12.0+xpu, as shipped in intel/llm-scaler-vllm:0.26.0-b2 (the upstream base image). All libraries are
 # JIT builds (-fsycl-targets=spir64): IGC finalizes the device code on first launch and caches it.
-# See README-ARC.md ("Building") for which flags are recorded and which are reconstructed.
+# These flags reproduce the production binaries (README-ARC.md, "Building").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 WHAT=${1:-all}

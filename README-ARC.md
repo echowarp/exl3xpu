@@ -26,12 +26,13 @@ compute-runtime (NEO) 26.31 / IGC 2.40 / Level Zero 1.32. All libraries are JIT 
 
 | Library | Source | Flags | Provenance of the flags |
 |---|---|---|---|
-| `exl3xpu/_C.so` | `csrc/exl3_ops.sycl` (+ headers) | `scripts/build_ext.sh` line + `-DEXL3_ALL_CODEBOOKS -DEXL3_K5_UNROLL24=4 -DEXL3_K5_MB128 -DEXL3_FOLD -DEXL3_HADOUT_B=8 -DEXL3_DPAS40_SMALLGRF -DEXL3_DPAS40_NT=1 -DEXL3_I4_U4DPAS -DEXL3_I4_K2T -DEXL3_SPEC_EPIU` (+ `-DEXL3_DNNL` when oneDNN is present) | **Reconstructed**: the build log of the production binary records no flags; the list comes from the build scripts of that build round. Not verified by a rebuild + checksum comparison. |
-| `exl3xpu/gdnchunk.so` | `gdnchunk/csrc/gdn_chunk_ops.sycl` | `-O3 -ffast-math -fsycl-device-code-split=per_kernel -DGDNC_PF=1 -DGDNC_PF_DIST=2 -DGDNC_PF_QK256=1 -DGDNC_CONV2=1 -DGDNC_VNNI2D=1 -DGDNC_PLANPAR=1 -DGDNC_CONV_VEC=4` | Documented with the production build when it was made; the binary itself carries no record. Not verified by a rebuild. |
-| `exl3xpu/ng.so` | `ng/ng_ops.sycl` | `-O3` (no `-ffast-math`), no `-D` options | The recorded build command. Not verified by a rebuild. |
+| `exl3xpu/_C.so` | `csrc/exl3_ops.sycl` (+ headers) | `scripts/build_ext.sh` line + `-DEXL3_ALL_CODEBOOKS -DEXL3_K5_UNROLL24=4 -DEXL3_K5_MB128 -DEXL3_FOLD -DEXL3_HADOUT_B=8 -DEXL3_DPAS40_SMALLGRF -DEXL3_DPAS40_NT=1 -DEXL3_I4_U4DPAS -DEXL3_I4_K2T -DEXL3_SPEC_EPIU` (+ `-DEXL3_DNNL` when oneDNN is present) | **Verified**: a rebuild with `scripts/build_arc.sh c` in the production image is byte-identical to the production binary. |
+| `exl3xpu/gdnchunk.so` | `gdnchunk/csrc/gdn_chunk_ops.sycl` | `-O3 -ffast-math -fsycl-device-code-split=per_kernel -DGDNC_PF=1 -DGDNC_PF_DIST=2 -DGDNC_PF_QK256=1 -DGDNC_CONV2=1 -DGDNC_VNNI2D=1 -DGDNC_PLANPAR=1 -DGDNC_CONV_VEC=4` | **Verified**: a rebuild has the identical device code (SPIR-V section) as the production binary; host code differs only by embedded source paths. |
+| `exl3xpu/ng.so` | `ng/ng_ops.sycl` | `-O3` (no `-ffast-math`), no `-D` options | **Verified**: a rebuild has the identical device code (SPIR-V section) as the production binary; host code differs only by embedded source paths. |
 
-Nothing here reproduces the production binaries byte for byte; rebuild and run the tests in `tests/` and `tests/arc/`
-before relying on a build.
+Verified on the production image (icpx 2025.3.3, PyTorch 2.12.0+xpu): `_C.so` rebuilds byte for byte; `gdnchunk.so` and
+`ng.so` rebuild with identical device code. Run the tests in `tests/` and `tests/arc/` after building with any other
+toolchain.
 
 ## Environment variables
 
