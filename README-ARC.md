@@ -100,8 +100,11 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_LAZY_VISION_MODE / _TTL / _MARGIN_MB` | default (auto / 120 / 256) | resident vs streamed policy, release after idle seconds, free-memory margin |
 | `EXL3_NOMMAP_LOAD` | default (1) | safetensors weights read with preadv, no mmap |
 | `EXL3_NOMMAP_DROP` | default (0) | also drop the read pages from the page cache |
+| `TORCH_CAP_MIB` | 29100 | `tools/oor/llmt_memprobe.py`: cap the torch XPU caching allocator (MiB) so the Level Zero driver keeps headroom |
+| `MEMPROBE_S` | 30 | allocator statistics to stderr every N seconds (`MEMPROBE=0` disables the thread) |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
+`PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.85`,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
 `num_speculative_tokens_per_batch_size=[[1,4,7],[5,5,5],[6,6,4],[7,8,3],[9,256,2]]` with
 `draft_sample_method=probabilistic` (stock vLLM 0.26 fields).
@@ -137,4 +140,5 @@ Nothing derived from traffic ships with this fork. The production values above p
 | `ng/ng_ops.sycl` | fused NaN guard library |
 | `exl3xpu/lazyvis.py` | lazy vision tower |
 | `exl3xpu/nommap_loader.py` | weight loading without mmap |
+| `tools/oor/` | torch XPU allocator cap + statistics (`.pth`-loaded) |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |
