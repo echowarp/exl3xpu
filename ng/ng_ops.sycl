@@ -1,0 +1,85 @@
+// fused NaN guard for the 27B. Separate torch library "exl3ng" so the production exl3xpu_C build is untouched.
+// gpu_model_runner._nan_guard (amax + isnan + isposinf + casts + clone + masked_fill + where, ~8 eager kernels) in one
+// pass: flags[r] = 1 if row r has a NaN, else 2 if it has +inf, else 0; a flagged row is rewritten to -inf except
+// logits[r, eos] = 0 (forced end-of-turn), as the original. Built WITHOUT -ffast-math (isnan / isinf must survive).
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <cmath>
+
+static sycl::queue& queue_of(const at::Tensor& t) {
+    return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+// NaN guard in one pass (gpu_model_runner._nan_guard: amax + isnan + isposinf + casts + clone + masked_fill + where,
+// ~8 eager kernels): flags[r] = 1 if row r has a NaN, else 2 if it has +inf, else 0; a flagged row is rewritten to -inf
+// except logits[r, eos] = 0 (forced end-of-turn), as the original. Same multi-work-group / last-arriver pattern as
+// fast_argmax; only the last work-group of a bad row does the rewrite.
+template <typename T, int WG>
+struct NanGuardKernel {
+    T* x; uint8_t* flags; uint32_t* bits; uint32_t* cnt; int V; int64_t stride; int NWG; int eos;
+    void operator()(sycl::nd_item<1> it) const {
+        int g = it.get_group(0), r = g / NWG, w = g % NWG, t = it.get_local_id(0);
+        T* row = x + (size_t)r * stride;
+        int chunk = (V + NWG - 1) / NWG, lo = w * chunk, hi = sycl::min(V, lo + chunk);
+        uint32_t b = 0;
+        for (int i = lo + t; i < hi; i += WG) {
+            float v = (float)row[i];
+            b |= (sycl::isnan(v) ? 1u : 0u) | ((sycl::isinf(v) && v > 0.f) ? 2u : 0u);
+        }
+        auto grp = it.get_group();
+        b = sycl::reduce_over_group(grp, b, sycl::bit_or<uint32_t>());
+        int* flag = sycl::ext::oneapi::group_local_memory_for_overwrite<int>(grp).get();
+        if (t == 0) {
+            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space> rb(bits[r]), c(cnt[r]);
+            if (b) rb.fetch_or(b);
+            uint32_t prev = c.fetch_add(1u);
+            int f = -1;
+            if (prev == (uint32_t)NWG - 1) {
+                uint32_t all = rb.load();
+                f = (all & 1u) ? 1 : ((all & 2u) ? 2 : 0);
+                flags[r] = (uint8_t)f;
+                rb.store(0u); c.store(0u);
+            }
+            *flag = f;
+        }
+        sycl::group_barrier(grp);
+        int f = *flag;
+        if (f <= 0) return;
+        for (int i = t; i < V; i += WG) row[i] = (T)(i == eos ? 0.f : -INFINITY);
+    }
+};
+static at::Tensor g_ng_bits, g_ng_cnt;
+at::Tensor nan_guard_rows(at::Tensor x, int64_t eos) {
+    TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1, "nan_guard_rows: [R, V] with unit column stride");
+    TORCH_CHECK(x.scalar_type() == at::kFloat || x.scalar_type() == at::kHalf, "nan_guard_rows: fp32 / fp16");
+    constexpr int WG = 256;
+    int R = x.size(0), V = x.size(1);
+    TORCH_CHECK(eos >= 0 && eos < V, "nan_guard_rows: eos");
+    auto flags = at::empty({R}, x.options().dtype(at::kByte));
+    if (R == 0) return flags;
+    const int NWG = std::max(8, std::min(128, 128 / std::max(1, R)));
+    if (!g_ng_cnt.defined() || g_ng_cnt.size(0) < R || g_ng_cnt.device() != x.device()) {
+        int cap = std::max(R, 256);
+        g_ng_cnt = at::zeros({cap}, x.options().dtype(at::kInt));
+        g_ng_bits = at::zeros({cap}, x.options().dtype(at::kInt));
+    }
+    auto& q = queue_of(x);
+    auto* bits = reinterpret_cast<uint32_t*>(g_ng_bits.data_ptr());
+    auto* cnt = reinterpret_cast<uint32_t*>(g_ng_cnt.data_ptr());
+    auto range = sycl::nd_range<1>((size_t)R * NWG * WG, WG);
+    if (x.scalar_type() == at::kFloat) {
+        NanGuardKernel<float, WG> k{x.data_ptr<float>(), flags.data_ptr<uint8_t>(), bits, cnt, V, x.stride(0), NWG, (int)eos};
+        q.submit([&](sycl::handler& h) { h.parallel_for(range, k); });
+    } else {
+        NanGuardKernel<sycl::half, WG> k{reinterpret_cast<sycl::half*>(x.data_ptr()), flags.data_ptr<uint8_t>(), bits, cnt, V, x.stride(0), NWG, (int)eos};
+        q.submit([&](sycl::handler& h) { h.parallel_for(range, k); });
+    }
+    return flags;
+}
+
+TORCH_LIBRARY(exl3ng, m) {
+    m.def("nan_guard_rows(Tensor(a!) x, int eos) -> Tensor");
+    m.impl("nan_guard_rows", torch::kXPU, &nan_guard_rows);
+}

@@ -19,4 +19,4 @@ exl3xpu = "exl3xpu.sglang_plugin:activate"
 packages = ["exl3xpu"]
 
 [tool.setuptools.package-data]
-exl3xpu = ["_C.so", "gdnchunk.so"]
+exl3xpu = ["_C.so", "gdnchunk.so", "ng.so"]

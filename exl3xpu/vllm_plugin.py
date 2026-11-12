@@ -1581,6 +1581,50 @@ def _patch_det_linear():
 
 
 
+def _patch_fast_nan_guard():
+    """EXL3_FAST_NAN_GUARD=1: gpu_model_runner._nan_guard's compute (amax, isnan,
+    isposinf, casts, clone, masked_fill, where: ~8 eager kernels, ~265 us host per step) as one exl3ng::nan_guard_rows
+    pass (separate library EXL3_NG_SO). Same flags and the same row rewrite
+    (test: identical for fp32/fp16, R 1..56, NaN / +inf / -inf / NaN-at-EOS rows); host 265 -> 13 us,
+    device 22-33 -> 4-12 us at 1-7 rows. The first call (sets up eos / ring buffer), injection tests and non-eligible
+    logits take the original."""
+    if os.environ.get("EXL3_FAST_NAN_GUARD", "0") != "1":
+        return
+    import torch
+    so = os.environ.get("EXL3_NG_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ng.so"))
+    try:
+        torch.ops.load_library(so)
+        E = torch.ops.exl3ng
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as R
+    except Exception as e:  # noqa
+        print(f"exl3xpu: fused NaN guard not installed ({e!r})", flush=True)
+        return
+    orig = getattr(R, "_nan_guard", None)
+    if orig is None or getattr(R, "_exl3_ng_patched", False):
+        return
+
+    def _nan_guard(self, logits, spec_decode_metadata=None):
+        if (logits is None or not hasattr(self, "_nan_guard_eos") or not getattr(self, "_nan_guard_on", True)
+                or self._nan_guard_inject or logits.dim() != 2 or logits.stride(-1) != 1
+                or logits.device.type != "xpu" or logits.dtype not in (torch.float16, torch.float32)):
+            return orig(self, logits, spec_decode_metadata)
+        flags = E.nan_guard_rows(logits, self._nan_guard_eos)
+        n = int(logits.shape[0])
+        buf = self._nan_guard_ring[self._nan_guard_ring_i]
+        self._nan_guard_ring_i = (self._nan_guard_ring_i + 1) % len(self._nan_guard_ring)
+        if n > buf.shape[0]:
+            buf = torch.zeros(n, dtype=torch.uint8, pin_memory=True)
+        buf[:n].copy_(flags, non_blocking=True)
+        if spec_decode_metadata is not None:
+            counts = [int(d) + 1 for d in spec_decode_metadata.num_draft_tokens]
+        else:
+            counts = [1] * len(self.input_batch.req_ids)
+        self._nan_guard_pending = (buf, n, list(self.input_batch.req_ids), counts, self._nan_state_probe)
+        return logits
+
+    R._nan_guard = _nan_guard
+    R._exl3_ng_patched = True
+    print("exl3xpu: fused NaN guard ON (EXL3_FAST_NAN_GUARD=1)", flush=True)
 
 
 def register():
@@ -1599,6 +1643,7 @@ def register():
     _patch_uniform_spec_only()
     _patch_gdn_recompute()
     _patch_int8kv_fast()
+    _patch_fast_nan_guard()
     if os.environ.get("EXL3_DS_SUB", "0") == "1" or os.environ.get("EXL3_DRAFT_GRAPH", "0") == "1":
         from . import draftgraph   # DS-SUB / DRAFT-GRAPH (before the graded-vocab propose wrapper)
         draftgraph.patch()

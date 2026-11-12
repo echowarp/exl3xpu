@@ -2,7 +2,7 @@
 # Build the Arc B70 kernel libraries of this fork inside an environment that has the oneAPI DPC++/C++ compiler (icpx),
 # oneDNN and the XPU build of PyTorch, e.g. the upstream image (docker/Dockerfile).
 #
-#   scripts/build_arc.sh [c|gdnchunk|all]      (default: all)
+#   scripts/build_arc.sh [c|gdnchunk|ng|all]      (default: all)
 #
 # Toolchain of the production build: Intel oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319), oneDNN 3.9.1,
 # PyTorch 2.12.0+xpu, as shipped in intel/llm-scaler-vllm:0.26.0-b2 (the upstream base image). All libraries are
@@ -42,11 +42,22 @@ build_gdnchunk() {
   ls -la ${GDNC_OUT:-exl3xpu/gdnchunk.so}
 }
 
+# ng.so (torch library exl3ng): fused NaN guard. Built WITHOUT -ffast-math (isnan / isinf must survive).
+build_ng() {
+  source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+  torch_flags
+  icpx -fsycl -fsycl-targets=spir64 -O3 -fPIC -std=c++17 -shared -D_GLIBCXX_USE_CXX11_ABI=1 \
+    $TORCH_INC -x c++ ng/ng_ops.sycl -x none -o ${NG_OUT:-exl3xpu/ng.so} $TORCH_LIB -Wno-deprecated-declarations
+  ls -la ${NG_OUT:-exl3xpu/ng.so}
+}
+
 case "$WHAT" in
   c) build_c ;;
   gdnchunk) build_gdnchunk ;;
+  ng) build_ng ;;
   all) build_c
        build_gdnchunk
+       build_ng
        ;;
   *) echo "usage: $0 [c|gdnchunk|ng|all] (what this version has)" >&2; exit 2 ;;
 esac

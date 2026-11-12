@@ -27,6 +27,7 @@ compute-runtime (NEO) 26.31 / IGC 2.40 / Level Zero 1.32. All libraries are JIT 
 |---|---|---|---|
 | `exl3xpu/_C.so` | `csrc/exl3_ops.sycl` (+ headers) | `scripts/build_ext.sh` line + `-DEXL3_ALL_CODEBOOKS -DEXL3_K5_UNROLL24=4 -DEXL3_K5_MB128 -DEXL3_FOLD -DEXL3_HADOUT_B=8 -DEXL3_DPAS40_SMALLGRF -DEXL3_DPAS40_NT=1 -DEXL3_I4_U4DPAS -DEXL3_I4_K2T -DEXL3_SPEC_EPIU` (+ `-DEXL3_DNNL` when oneDNN is present) | **Reconstructed**: the build log of the production binary records no flags; the list comes from the build scripts of that build round. Not verified by a rebuild + checksum comparison. |
 | `exl3xpu/gdnchunk.so` | `gdnchunk/csrc/gdn_chunk_ops.sycl` | `-O3 -ffast-math -fsycl-device-code-split=per_kernel -DGDNC_PF=1 -DGDNC_PF_DIST=2 -DGDNC_PF_QK256=1 -DGDNC_CONV2=1 -DGDNC_VNNI2D=1 -DGDNC_PLANPAR=1 -DGDNC_CONV_VEC=4` | Documented with the production build when it was made; the binary itself carries no record. Not verified by a rebuild. |
+| `exl3xpu/ng.so` | `ng/ng_ops.sycl` | `-O3` (no `-ffast-math`), no `-D` options | The recorded build command. Not verified by a rebuild. |
 
 Nothing here reproduces the production binaries byte for byte; rebuild and run the tests in `tests/` before relying
 on a build.
@@ -93,6 +94,8 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_UNIFORM_SPEC` | 1 | uniform-decode dispatch only for all-spec-decode steps (a prefill chunk of exactly 1 + k tokens is not run as a spec decode) |
 | `EXL3_DET_LINEAR` | 1 | unquantized fp16 linears through oneDNN with deterministic primitives (custom op) |
 | `EXL3_DETERMINISTIC` | default (0) | torch.use_deterministic_algorithms for the whole process (test only) |
+| `EXL3_FAST_NAN_GUARD` | 1 | fused NaN guard `exl3ng::nan_guard_rows` for the runner's `_nan_guard` (vLLM patch: gpu_model_runner NaN guard) |
+| `EXL3_NG_SO` | default (`exl3xpu/ng.so`) | NaN-guard library |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
@@ -121,10 +124,11 @@ Nothing derived from traffic ships with this fork. The production values above p
 
 | Path | What |
 |---|---|
-| `scripts/build_arc.sh` | builds the kernel libraries with the production options |
+| `scripts/build_arc.sh` | builds `_C.so`, `gdnchunk.so` and `ng.so` with the production options |
 | `csrc/` | ESIMD/SYCL kernels of `_C.so` (upstream files extended; new headers per feature) |
 | `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` | B70 split-K table for the decode linears |
 | `exl3xpu/draftdyn.py` | DRAFT-DYN row selection / batch assembly / sample fix-up (CPU-testable) |
 | `exl3xpu/draftgraph.py` | DS-SUB and DRAFT-GRAPH |
 | `gdnchunk/` | GDN chunked prefill port (Apache-2.0, derived from Magnitude; own `LICENSE` and `NOTICE`) |
+| `ng/ng_ops.sycl` | fused NaN guard library |
 | `THIRD_PARTY_NOTICES.md` | licenses of third-party code in this fork |
