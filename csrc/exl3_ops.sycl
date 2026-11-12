@@ -5,6 +5,7 @@
 #include <c10/xpu/XPUStream.h>
 #include "exl3_esimd.h"
 #include "fa_esimd.h"
+#include "fa_spec_esimd.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "norm_sycl.h"
 static int g_norm_wg = 128;
@@ -767,6 +768,187 @@ void exl3_fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::T
     qq.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, G), props, kern); });
 }
 
+// ---- speculative-verify decode attention (paged fp16 KV, head_dim 256, q_len <= 8): KV read once per work-group
+static void spec_attn_impl(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, at::Tensor block_table, at::Tensor seqused,
+                           at::Tensor out, int64_t q_len, double scale, int64_t splits,
+                           std::optional<at::Tensor> k_scale, std::optional<at::Tensor> v_scale,
+                           const at::Tensor* qsl, const std::optional<at::Tensor>& rot = std::nullopt) {
+    // fp8 (e4m3fn) KV caches supported (k_scale/v_scale: per-tensor float32 device scalars)
+    const bool f8 = k_cache.scalar_type() == at::kFloat8_e4m3fn;
+    // int8_per_token_head (vLLM Triton layout, NHD): K/V views [blocks, BS, H, 260] int8 with inline f32 scales at byte 256
+    const bool i8 = k_cache.scalar_type() == at::kChar;
+    // int4_per_token_head: K/V views [blocks, BS, H, 132] uint8 (nibbles + inline f32 scale with zp)
+    const bool i4 = k_cache.scalar_type() == at::kByte && k_cache.dim() == 4 && k_cache.size(3) == 132;
+    TORCH_CHECK(q.scalar_type() == at::kHalf && k_cache.scalar_type() == v_cache.scalar_type() &&
+                (k_cache.scalar_type() == at::kHalf || f8 || i8 || i4), "exl3_spec_attn: fp16 q, fp16 / fp8_e4m3fn / int8 / int4 cache");
+    if (i4) {
+        TORCH_CHECK(v_cache.size(3) == 132 && k_cache.stride(3) == 1 && k_cache.stride(2) == 264 &&
+                    k_cache.stride(1) == k_cache.size(2) * 264 && k_cache.stride(1) % 16 == 0 &&
+                    v_cache.stride(0) == k_cache.stride(0) && (char*)v_cache.data_ptr() == (char*)k_cache.data_ptr() + 132 &&
+                    k_cache.stride(0) % 64 == 0 && (reinterpret_cast<uintptr_t>(k_cache.data_ptr()) % 64) == 0,
+                    "exl3_spec_attn: int4 cache must be vLLM's NHD per-token-head layout");
+        TORCH_CHECK(k_cache.size(1) % 32 == 0, "block_size must be a multiple of 32");
+    }
+    if (i8) {
+        TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(3) == 260 && v_cache.size(3) == 260 && k_cache.stride(3) == 1 &&
+                    k_cache.stride(2) == 520 && k_cache.stride(1) == k_cache.size(2) * 520 && k_cache.stride(1) % 16 == 0 &&
+                    v_cache.stride(0) == k_cache.stride(0) && (char*)v_cache.data_ptr() == (char*)k_cache.data_ptr() + 260 &&
+                    k_cache.stride(0) % 64 == 0 && (reinterpret_cast<uintptr_t>(k_cache.data_ptr()) % 64) == 0,
+                    "exl3_spec_attn: int8 cache must be vLLM's NHD per-token-head layout");
+        TORCH_CHECK(k_cache.size(1) % 32 == 0, "block_size must be a multiple of 32");
+    }
+    at::Tensor ksc, vsc;
+    if (f8) {
+        auto one = at::ones({1}, q.options().dtype(at::kFloat));
+        ksc = k_scale.has_value() && k_scale->defined() ? k_scale->to(at::kFloat).reshape({-1}).contiguous() : one;
+        vsc = v_scale.has_value() && v_scale->defined() ? v_scale->to(at::kFloat).reshape({-1}).contiguous() : one;
+    }
+    TORCH_CHECK(q.dim() == 3 && q.size(2) == 256 && q.is_contiguous(), "q [T, Hq, 256] contiguous");
+    if (!i8 && !i4) {
+    TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(3) == 256 && v_cache.sizes() == k_cache.sizes());
+    // any [block, token, head, 256] strides that keep 2D block loads legal (64-byte aligned rows/heads/blocks);
+    // vLLM XPU interleaves K and V per head: token stride 2048, head stride 512
+    TORCH_CHECK(k_cache.stride(1) == v_cache.stride(1) && k_cache.stride(2) == v_cache.stride(2));
+    for (auto* c : {&k_cache, &v_cache})
+        TORCH_CHECK(c->stride(3) == 1 && c->stride(2) % 32 == 0 && c->stride(1) % 32 == 0 && c->stride(0) % 32 == 0 &&
+                    c->stride(2) >= 256 && c->stride(1) >= c->size(2) * c->stride(2) && (c->storage_offset() % 32) == 0,
+                    "exl3_spec_attn: unsupported k/v cache strides");
+    TORCH_CHECK(k_cache.size(1) % 32 == 0, "block_size must be a multiple of 32");
+    }
+    TORCH_CHECK(block_table.scalar_type() == at::kInt && seqused.scalar_type() == at::kInt);
+    TORCH_CHECK(q_len >= 1 && q_len <= 8);
+    TORCH_CHECK(out.scalar_type() == at::kHalf && out.size(-1) == 256 && out.stride(-1) == 1);
+    int T = q.size(0), Hq = q.size(1), Hk = k_cache.size(2), BS = k_cache.size(1);
+    // varlen (qsl = query_start_loc [B+1], int32, device): B from qsl, q_len = 8 = the partial-buffer row stride;
+    // requests with more than 8 rows are skipped (their rows of out are left untouched)
+    int B = qsl ? (int)qsl->numel() - 1 : T / q_len;
+    if (qsl) { TORCH_CHECK(q_len == 8 && qsl->scalar_type() == at::kInt && qsl->is_contiguous(), "varlen: q_len 8, int32 qsl"); }
+    else { TORCH_CHECK(B * q_len == T, "q rows must be B * q_len"); }
+    TORCH_CHECK(Hq % Hk == 0 && seqused.size(0) >= B && block_table.size(0) >= B);
+    if (B <= 0) return;
+    int G = Hq / Hk, S = (int)splits;
+    // splits <= 0: one resident wave (256-GRF threads: 32 Xe x 8 XVE x 4 = 1024), fixed per batch size (graph-safe)
+    if (S <= 0) S = std::max(4, std::min(64, (1024 + B * Hk * G - 1) / (B * Hk * G)));
+    // HEAD-PACK (EXL3_SPEC_HP, default 0): plain decode with q_len * G <= 8
+    // packs the G heads into the DPAS rows and splits the keys over the work-group's threads (S * G partials; S capped
+    // so S * G <= MERGE_MAX_S). Split count S = max(EXL3_SPEC_HP_MIN, EXL3_SPEC_HP_S / B), fixed per batch size.
+    static const int hp_env = [] { const char* e = std::getenv("EXL3_SPEC_HP"); return e ? std::atoi(e) : 0; }();
+    static const int hp_s1 = [] { const char* e = std::getenv("EXL3_SPEC_HP_S"); return e ? std::atoi(e) : 8; }();
+    static const int hp_min = [] { const char* e = std::getenv("EXL3_SPEC_HP_MIN"); return e ? std::atoi(e) : 1; }();
+    // EXL3_SPEC_HP_BMAX (default 1): 27B microbench: HP wins 40-48% at B=1 from 8k on,
+    // mixed at B=2..4 with S >= 8 (worse at 36k)
+    static const int hp_bmax = [] { const char* e = std::getenv("EXL3_SPEC_HP_BMAX"); return e ? std::atoi(e) : 1; }();
+    const bool hp = hp_env && !qsl && G > 1 && q_len * G <= 8 && B <= hp_bmax;
+    if (hp) S = std::max(hp_min, hp_s1 / B);
+    if (hp && S * G > exl3fa::MERGE_MAX_S) S = exl3fa::MERGE_MAX_S / G;
+    const int Sp = hp ? S * G : S;
+    auto bt = block_table.is_contiguous() ? block_table : block_table.contiguous();
+    auto opart = at::empty({B, Sp, q_len, Hq, 256}, q.options());
+    auto lpart = at::empty({B, Sp, q_len, Hq}, q.options().dtype(at::kFloat));
+    auto& qq = queue_of(q);
+    int n = B * Hk * S * G;
+    // rot = vLLM's RHT signs (float32 [256], device): q / output rotated in-kernel
+    const float* rsign = nullptr;
+    if (rot.has_value() && rot->defined()) {
+        TORCH_CHECK(i4 && rot->scalar_type() == at::kFloat && rot->numel() == 256 && rot->is_contiguous(),
+                    "exl3_spec_attn: rot = float32 [256] signs, int4 cache only");
+        rsign = rot->data_ptr<float>();
+    }
+    // PREROT (EXL3_I4_PREROT, default 1): rotate q once per call into an fp32 buffer (one 256-item
+    // work-group per row and head: signs, SLM butterfly, / 256) instead of once per split thread inside the kernel
+    static const int prerot = [] { const char* e = std::getenv("EXL3_I4_PREROT"); return e ? std::atoi(e) : 1; }();
+    at::Tensor qrot_t; const float* qrot = nullptr;
+    if (rsign && prerot) {
+        const int64_t rows = q.size(0) * (int64_t)Hq;
+        qrot_t = at::empty({q.size(0), (int64_t)Hq, 256}, q.options().dtype(at::kFloat));
+        float* qo = qrot_t.data_ptr<float>();
+        const sycl::half* qi = reinterpret_cast<const sycl::half*>(q.data_ptr());
+        const int64_t qs0 = q.stride(0), qs1 = q.stride(1);
+        const int HqL = Hq; const float* sg = rsign;
+        queue_of(q).submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> xs(256, h);
+            h.parallel_for(sycl::nd_range<1>(rows * 256, 256), [=](sycl::nd_item<1> it) {
+                const int d = it.get_local_id(0); const int64_t r = it.get_group(0);
+                const int64_t t = r / HqL; const int hh = (int)(r % HqL);
+                auto grp = it.get_group();
+                xs[d] = (float)qi[t * qs0 + hh * qs1 + d] * sg[d];
+                sycl::group_barrier(grp);
+                for (int L = 1; L < 256; L <<= 1) {
+                    if ((d & L) == 0) { float lo = xs[d], hi = xs[d + L]; xs[d] = lo + hi; xs[d + L] = lo - hi; }
+                    sycl::group_barrier(grp);
+                }
+                qo[r * 256 + d] = xs[d] * (1.0f / 256.0f);
+            });
+        });
+        qrot = qo;
+    }
+    sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+    auto launch = [&](auto kern) { qq.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, G), props, kern); }); };
+    auto fill = [&](auto& kern) {
+        kern.q = reinterpret_cast<const sycl::half*>(q.data_ptr());
+        kern.kc = reinterpret_cast<const sycl::half*>(k_cache.data_ptr());
+        kern.vc = reinterpret_cast<const sycl::half*>(v_cache.data_ptr());
+        kern.block_table = bt.data_ptr<int>(); kern.seqused = seqused.data_ptr<int>();
+        kern.opart = reinterpret_cast<sycl::half*>(opart.data_ptr()); kern.lpart = lpart.data_ptr<float>();
+        kern.B = B; kern.QL = (int)q_len; kern.Hq = Hq; kern.Hk = Hk; kern.G = G; kern.BS = BS; kern.S = S;
+        kern.bt_stride = (int)bt.stride(0); kern.scale_log2 = (float)(scale * 1.4426950408889634);
+        kern.kbs = (size_t)k_cache.stride(0); kern.vbs = (size_t)v_cache.stride(0);
+        kern.tstride = (int)k_cache.stride(1); kern.hstride = (int)k_cache.stride(2);
+        kern.qsl = qsl ? qsl->data_ptr<int>() : nullptr;
+        kern.hp = hp ? 1 : 0;
+        // VARR loses at long context (97k B=3 +80%, B=4 +46%;
+        // 49k B=4 +6%) and wins up to ~49k at B 2-3 (-4..-5.5%): gate it per sequence inside the kernel
+        static const int varr_maxl = [] { const char* e = std::getenv("EXL3_SPEC_VARR_MAXL"); return e ? std::atoi(e) : 40000; }();
+        kern.varr_maxl = varr_maxl;
+    };
+    if (f8) {
+        exl3fa::FaSpecKernelT<1> kern{}; fill(kern);
+        kern.ks = ksc.data_ptr<float>(); kern.vs = vsc.data_ptr<float>();
+        launch(kern);
+    } else if (i4) {
+        // the <KVM, true> instance compiles without spilling the O accumulator (IGC RA
+        // heuristic: the plain instance spills 5.2-5.8 KB incl. all of O); EXL3_SPEC_VAT=0: the plain instance
+        static const int vat = [] { const char* e = std::getenv("EXL3_SPEC_VAT"); return e ? std::atoi(e) : 0; }();
+        if (vat) { exl3fa::FaSpecKernelT<3, true> kern{}; fill(kern); kern.rsign = rsign; kern.qrot = qrot; launch(kern); }
+        else { exl3fa::FaSpecKernelT<3> kern{}; fill(kern); kern.rsign = rsign; kern.qrot = qrot; launch(kern); }
+    } else if (i8) {
+        // VARR: 4-tile V loads for B >= 2 (EXL3_SPEC_VARR=0 disables; default on)
+        static const int varr_env = [] { const char* e = std::getenv("EXL3_SPEC_VARR"); return e ? std::atoi(e) : 1; }();
+        static const int vat8 = [] { const char* e = std::getenv("EXL3_SPEC_VAT"); return e ? std::atoi(e) : 0; }();
+        if (varr_env && !hp && B >= 2) { exl3fa::FaSpecKernelT<2, true> kern{}; fill(kern); launch(kern); }
+        else if (vat8 && !hp) { exl3fa::FaSpecKernelT<2, true> kern{}; fill(kern); kern.va_min_b = 1 << 30; launch(kern); }
+        else { exl3fa::FaSpecKernelT<2> kern{}; fill(kern); launch(kern); }
+    } else {
+        exl3fa::FaSpecKernelT<0> kern{}; fill(kern);
+        launch(kern);
+    }
+    int out_stride = out.dim() == 3 ? (int)out.stride(0) : (int)out.stride(0);
+    TORCH_CHECK(Sp <= exl3fa::MERGE_MAX_S, "exl3_spec_attn: at most MERGE_MAX_S splits");
+    int nm = B * (int)q_len * Hq * 256;
+    qq.submit([&](sycl::handler& h) {
+        exl3fa::FaSpecMerge mk{reinterpret_cast<const sycl::half*>(opart.data_ptr()), lpart.data_ptr<float>(),
+                               reinterpret_cast<sycl::half*>(out.data_ptr()), B, (int)q_len, Hq, Sp, 256, out_stride,
+                               qsl ? qsl->data_ptr<int>() : nullptr,
+                               sycl::local_accessor<float, 1>(exl3fa::MERGE_MAX_S, h),
+                               sycl::local_accessor<float, 1>(256, h), rsign};
+        h.parallel_for(sycl::nd_range<1>(nm, 256), mk);
+    });
+}
+
+void exl3_spec_attn(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, at::Tensor block_table, at::Tensor seqused,
+                    at::Tensor out, int64_t q_len, double scale, int64_t splits,
+                    std::optional<at::Tensor> k_scale, std::optional<at::Tensor> v_scale, std::optional<at::Tensor> rot) {
+    spec_attn_impl(q, k_cache, v_cache, block_table, seqused, out, q_len, scale, splits, k_scale, v_scale, nullptr, rot);
+}
+
+// varlen decode/spec batch (requests with 1..8 query rows each, e.g. the MTP drafter's first
+// pass after different acceptance counts) in one launch with no host sync; requests with > 8 rows are skipped.
+void exl3_spec_attn_varlen(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, at::Tensor block_table, at::Tensor seqused,
+                           at::Tensor query_start_loc, at::Tensor out, double scale, int64_t splits,
+                           std::optional<at::Tensor> k_scale, std::optional<at::Tensor> v_scale, std::optional<at::Tensor> rot) {
+    spec_attn_impl(q, k_cache, v_cache, block_table, seqused, out, 8, scale, splits, k_scale, v_scale, &query_start_loc, rot);
+}
+
 // ---- diagnostic: stream the trellis with exactly the MB=8 DPAS thread mapping (strip of NT tiles x K split),
 // no decode, no DPAS: an xor-reduce per thread. Tells whether the access pattern + static split partition can
 // reach the DRAM ceiling on their own.
@@ -1189,6 +1371,10 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_local(int n) -> ()", &exl3_set_local);
     m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
     m.def("exl3_fa_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
+    m.def("exl3_spec_attn(Tensor q, Tensor k_cache, Tensor v_cache, Tensor block_table, Tensor seqused, Tensor(a!) out, int q_len, float scale, int splits, Tensor? k_scale=None, Tensor? v_scale=None, Tensor? rot=None) -> ()");
+    m.impl("exl3_spec_attn", torch::kXPU, &exl3_spec_attn);
+    m.def("exl3_spec_attn_varlen(Tensor q, Tensor k_cache, Tensor v_cache, Tensor block_table, Tensor seqused, Tensor query_start_loc, Tensor(a!) out, float scale, int splits, Tensor? k_scale=None, Tensor? v_scale=None, Tensor? rot=None) -> ()");
+    m.impl("exl3_spec_attn_varlen", torch::kXPU, &exl3_spec_attn_varlen);
     m.def("exl3_mlp_small(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, Tensor(a!) out, int K_gu, int K_dn) -> ()");
     m.impl("exl3_mlp_small", torch::kXPU, &exl3_mlp_small);
     m.def("mlp_small(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, int K_gu, int K_dn) -> Tensor");

@@ -43,6 +43,12 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_FUSED_MLP` | default (1) | fused decode MLP (`mlp_auto`: 3..8 rows in one op; prefill MLP middle fused for int8 prefill) |
 | `EXL3_FAST_NORM` | default (1) | fused residual add + RMSNorm for decode batches (replaces `custom_esimd_kernels_vllm.esimd_fused_add_rms_norm_batched`) |
 | `EXL3_FAST_NORM_WG` | default (256) | work-group size of that kernel |
+| `EXL3_SPEC_HP` | 1 | HEAD-PACK: plain decode attention with q_len * G <= 8 packs the G query heads into the DPAS rows (the MTP drafter's 1-row calls) |
+| `EXL3_SPEC_HP_BMAX` | 8 | HEAD-PACK up to this many sequences (default 1) |
+| `EXL3_SPEC_HP_S / EXL3_SPEC_HP_MIN` | default (8 / 1) | HEAD-PACK split count max(MIN, S / B) |
+| `EXL3_SPEC_VARR` | default (1) | VARR: 4-tile V loads in the int8 verify kernel for >= 2 sequences |
+| `EXL3_SPEC_VARR_MAXL` | 84000 | VARR only for sequences up to this many tokens (in-kernel gate; default 40000) |
+| `EXL3_SPEC_VAT` | default (0) | use the VARR kernel instance with plain loads (register-allocation variant) |
 
 Other production settings outside this package: vLLM `gpu_memory_utilization` 0.94,
 `attention_backend=TRITON_ATTN`, `max_num_batched_tokens` 8192; the MTP depth schedule
