@@ -1542,12 +1542,59 @@ def _patch_uniform_spec_only():
     logger.info("exl3: UNIFORM-SPEC on (uniform-decode dispatch only for all-spec-decode steps)")
 
 
+def _patch_det_linear():
+    """EXL3_DET_LINEAR=1 (a root cause of nondeterministic output on the Arc): the unquantized fp16 linears (vLLM
+    UnquantizedLinearMethod, e.g. the GDN in_proj_a/b, N=96) run through oneDNN with deterministic primitives. oneDNN
+    picks a nondeterministic (split-K) GEMM for some row counts (in_proj_ba at M = 2,352..2,355: up to 33 elements differ
+    between identical calls). torch's global deterministic flag fixes it but breaks Inductor's autotuning at startup,
+    so the flag is set only inside an opaque custom op around F.linear (the oneDNN primitive is created with the
+    deterministic attribute then). Measured not slower (2,355 x 5120 x 96: 0.68 vs 0.82 ms)."""
+    if os.environ.get("EXL3_DET_LINEAR", "0") != "1":
+        return
+    import torch
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    @torch.library.custom_op("exl3det::linear", mutates_args=())
+    def det_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None) -> torch.Tensor:
+        prev, prev_warn = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            return F.linear(x, w, b)
+        finally:
+            torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+
+    @det_linear.register_fake
+    def _(x, w, b):
+        return x.new_empty((*x.shape[:-1], w.shape[0]))
+
+    _orig = UnquantizedLinearMethod.apply
+
+    def apply(self, layer, x, bias=None):
+        w = getattr(layer, "weight", None)
+        if w is None or not x.is_xpu or w.dtype != x.dtype or w.dim() != 2:
+            return _orig(self, layer, x, bias)
+        return torch.ops.exl3det.linear(x, w, bias)
+
+    UnquantizedLinearMethod.apply = apply
+    print("exl3xpu: deterministic unquantized linears ON (EXL3_DET_LINEAR=1)", flush=True)
+
+
+
 
 
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
+    if os.environ.get("EXL3_DETERMINISTIC", "0") == "1":   # nondeterminism test
+        try:
+            import torch
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            print("exl3xpu: torch deterministic algorithms ON (EXL3_DETERMINISTIC=1)", flush=True)
+        except Exception as e:  # noqa
+            print(f"exl3xpu: deterministic algorithms not enabled ({e!r})", flush=True)
     _patch_fused_mlp()
     _patch_fast_norm()
+    _patch_det_linear()
     _patch_dyn_sd_full()
     _patch_uniform_spec_only()
     _patch_gdn_recompute()
