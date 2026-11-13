@@ -4,6 +4,7 @@
 #include <torch/library.h>
 #include <c10/xpu/XPUStream.h>
 #include "exl3_esimd.h"
+#include "lora_esimd.h"
 #include "fa_esimd.h"
 #include "fa_spec_esimd.h"
 #include "fa_prefill_i8.h"
@@ -329,20 +330,28 @@ void exl3_noop(at::Tensor t, int64_t n, int64_t items) {
     for (int64_t i = 0; i < n; ++i) q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(items, 16), NoopKernel{p}); });
 }
 
+static void gemm_small_impl(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
+                            at::Tensor out, int64_t K, int64_t cb, const LoraArgs* la);
 void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
                      at::Tensor out, int64_t K, int64_t cb) {
+    gemm_small_impl(x, trellis, suh, svh, shard_of_nb, out, K, cb, nullptr);
+}
+// la != nullptr (linear_lora): same kernels, split-K and tiling as the base path, with had_in / had_out replaced by
+// their LoRA variants (lora_esimd.h); never the opt-in fused / fused_in single-kernel paths.
+static void gemm_small_impl(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
+                            at::Tensor out, int64_t K, int64_t cb, const LoraArgs* la) {
     TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1, "x must be 2D row-major");
     TORCH_CHECK(trellis.scalar_type() == at::kShort && trellis.is_contiguous());
     auto& q = queue_of(x);
     int M = x.size(0), Kdim = x.size(1), N = svh.size(0), S = suh.size(0);
-    if (g_fused && M <= 8 && x.scalar_type() == at::kHalf && out.scalar_type() == at::kHalf && out.stride(1) == 1 &&
+    if (!la && g_fused && M <= 8 && x.scalar_type() == at::kHalf && out.scalar_type() == at::kHalf && out.stride(1) == 1 &&
         N / 128 <= (1 << 16)) {
         bool done = false;
         if (K == 4 && cb == 2) done = fused_small<4, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
         else if (K == 6 && cb == 2) done = fused_small<6, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
         if (done) return;
     }
-    if (g_fused_in && M > g_vec_max_m && M <= 8 && x.scalar_type() == at::kHalf) {
+    if (!la && g_fused_in && M > g_vec_max_m && M <= 8 && x.scalar_type() == at::kHalf) {
         if (K == 4 && cb == 2) { fused_in_small<4, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q); return; }
         if (K == 6 && cb == 2) { fused_in_small<6, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q); return; }
     }
@@ -367,6 +376,13 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
     // blocked activations [S][Mp][Kdim] (row-blocked inside); pad rows must be zero for DPAS
     auto xh = at::empty({S, Mp, Kdim}, x.options().dtype(at::kHalf));   // pad rows zeroed by HadInKernel
     if (!(g_stage_mask & 1)) ;
+    else if (la) {
+        TORCH_CHECK(x.scalar_type() == at::kHalf, "linear_lora: fp16 x");
+        HadInLoraKernel<fp16> k{reinterpret_cast<const fp16*>(x.data_ptr()), reinterpret_cast<const fp16*>(suh.data_ptr()),
+                                reinterpret_cast<fp16*>(xh.data_ptr()), M, Kdim, S, (int)x.stride(0), Mp, 0, *la};
+        int n = S * Mp * (Kdim / 128);
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), k); });
+    }
     else if (x.scalar_type() == at::kHalf) launch_had_in<fp16>(x, suh, xh, q);
     else if (x.scalar_type() == at::kBFloat16) launch_had_in<sycl::ext::oneapi::bfloat16>(x, suh, xh, q);
     else TORCH_CHECK(false, "x dtype");
@@ -410,10 +426,70 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
     TORCH_CHECK(ok, "exl3_gemm_small: unsupported K/codebook ", K, "/", cb);
 
     if (!(g_stage_mask & 4)) return;
+    if (la) {
+        TORCH_CHECK(out.scalar_type() == at::kHalf, "linear_lora: fp16 out");
+        HadOutLoraKernel k{part.data_ptr<float>(), reinterpret_cast<const fp16*>(svh.data_ptr()),
+                           reinterpret_cast<fp16*>(out.data_ptr()), M, N, P, (int)out.stride(0), *la};
+        int n = M * (N / 128);
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), k); });
+        return;
+    }
     if (out.scalar_type() == at::kHalf) launch_had_out<fp16>(part, P, svh, out, q);
     else if (out.scalar_type() == at::kBFloat16) launch_had_out<sycl::ext::oneapi::bfloat16>(part, P, svh, out, q);
     else if (out.scalar_type() == at::kFloat) launch_had_out<float>(part, P, svh, out, q);
     else TORCH_CHECK(false, "out dtype");
+}
+
+// ---- LoRA (lora_esimd.h): slot buffers as vLLM keeps them (A_j [L, 1, 16, K] distinct, B_s [L, 1, N_s, 16], fp16),
+// idx = slot per row (int32 / int64, -1 = none), a_of[s] = A index of slice s, soff = slice column offsets (S + 1,
+// multiples of 128). Returns the args + the shrink partial buffer (keep alive until the kernels are queued).
+static std::pair<LoraArgs, at::Tensor> make_lora(const at::Tensor& like, int M, int Kdim, const std::vector<at::Tensor>& A,
+                                                 const std::vector<at::Tensor>& B, const at::Tensor& idx,
+                                                 const std::vector<int64_t>& a_of, const std::vector<int64_t>& soff,
+                                                 double scale) {
+    const int G = A.size(), S = B.size();
+    TORCH_CHECK(G >= 1 && G <= LMAXG && S >= 1 && S <= LMAXS && (int)a_of.size() == S && (int)soff.size() == S + 1,
+                "lora: 1..4 distinct A, 1..4 slices");
+    TORCH_CHECK(Kdim % 128 == 0, "lora: K multiple of 128");
+    LoraArgs la{};
+    for (int j = 0; j < G; ++j) {
+        TORCH_CHECK(A[j].scalar_type() == at::kHalf && A[j].dim() == 4 && A[j].size(2) == LR && A[j].size(3) == Kdim &&
+                    A[j].stride(3) == 1 && A[j].stride(2) == Kdim && A[j].stride(0) % 64 == 0, "lora: A layout");
+        la.A[j] = reinterpret_cast<const fp16*>(A[j].data_ptr()); la.as[j] = A[j].stride(0);
+    }
+    for (int s = 0; s < S; ++s) {
+        TORCH_CHECK(B[s].scalar_type() == at::kHalf && B[s].dim() == 4 && B[s].size(3) == LR && B[s].stride(3) == 1 &&
+                    B[s].stride(2) == LR && B[s].stride(0) % 64 == 0 && B[s].size(2) == soff[s + 1] - soff[s] &&
+                    soff[s] % 128 == 0 && a_of[s] >= 0 && a_of[s] < G, "lora: B layout / slice offsets");
+        la.B[s] = reinterpret_cast<const fp16*>(B[s].data_ptr()); la.bs[s] = B[s].stride(0);
+        la.off[s] = soff[s]; la.ga[s] = a_of[s];
+    }
+    TORCH_CHECK(soff[S] % 128 == 0);
+    for (int s = S; s <= LMAXS; ++s) la.off[s] = soff[S];
+    la.G = G; la.S = S;
+    TORCH_CHECK(idx.dim() == 1 && idx.size(0) >= M && idx.stride(0) == 1 && idx.device() == like.device());
+    if (idx.scalar_type() == at::kLong) la.idx64 = idx.data_ptr<int64_t>();
+    else { TORCH_CHECK(idx.scalar_type() == at::kInt); la.idx32 = idx.data_ptr<int32_t>(); }
+    la.KB = Kdim / 128;
+    auto lp = at::empty({(int64_t)G * la.KB * std::max(M, 1) * LR}, like.options().dtype(at::kFloat));
+    la.lp = lp.data_ptr<float>();
+    la.scale = (float)scale;
+    return {la, lp};
+}
+
+// out = EXL3 linear(x) + LoRA(x) on the small-M (decode) path: 3 launches, as the base linear.
+at::Tensor exl3_linear_lora(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
+                            int64_t K, int64_t cb, std::vector<at::Tensor> A, std::vector<at::Tensor> B, at::Tensor idx,
+                            std::vector<int64_t> a_of, std::vector<int64_t> soff, double scale) {
+    TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kHalf, "linear_lora: x [M, K] fp16");
+    auto x2 = x.is_contiguous() ? x : x.contiguous();
+    const int M = x2.size(0), Kdim = x2.size(1);
+    auto out = at::empty({M, svh.size(0)}, x2.options());
+    if (M == 0) return out;
+    TORCH_CHECK(soff.back() == svh.size(0), "linear_lora: slices cover the output");
+    auto lo = make_lora(x2, M, Kdim, A, B, idx, a_of, soff, scale);
+    gemm_small_impl(x2, trellis, suh, svh, shard_of_nb, out, K, cb, &lo.first);
+    return out;
 }
 
 
@@ -1515,6 +1591,47 @@ void exl3_mlp_small(at::Tensor x, at::Tensor gu_tr, at::Tensor gu_suh, at::Tenso
     at::Tensor part2 = K_dn == 4 ? dpas8_parts<4>(xh2, dn_tr, dn_shard, M, I, Hn, q) : dpas8_parts<6>(xh2, dn_tr, dn_shard, M, I, Hn, q);
     launch_had_out<fp16>(part2, (int)part2.size(0), dn_svh, out, q);
 }
+// fused decode MLP + LoRA (3 <= M <= 8): the 5 launches of exl3_mlp_small, LoRA terms inside had_in / MlpMid / had_out
+at::Tensor exl3_mlp_small_lora(at::Tensor x, at::Tensor gu_tr, at::Tensor gu_suh, at::Tensor gu_svh, at::Tensor gu_shard,
+                               at::Tensor dn_tr, at::Tensor dn_suh, at::Tensor dn_svh, at::Tensor dn_shard, int64_t K_gu,
+                               int64_t K_dn, std::vector<at::Tensor> A_gu, std::vector<at::Tensor> B_gu,
+                               std::vector<int64_t> a_of_gu, std::vector<at::Tensor> A_dn, std::vector<at::Tensor> B_dn,
+                               at::Tensor idx, double scale) {
+    auto x2 = x.is_contiguous() ? x : x.contiguous();
+    TORCH_CHECK(x2.dim() == 2 && x2.scalar_type() == at::kHalf, "mlp_small_lora: x [M, H] fp16");
+    TORCH_CHECK(gu_suh.size(0) == 1 || gu_suh.size(0) == 2, "gate_up: 1 or 2 input shards");
+    TORCH_CHECK(dn_suh.size(0) == 1, "down: one shard");
+    TORCH_CHECK((K_gu == 4 || K_gu == 6) && (K_dn == 4 || K_dn == 6));
+    int M = x2.size(0), H = x2.size(1), N2 = gu_svh.size(0), I = N2 / 2, Hn = dn_svh.size(0);
+    TORCH_CHECK(M >= 1 && M <= 8 && dn_suh.size(1) == I && B_gu.size() == 2 && A_dn.size() == 1 && B_dn.size() == 1);
+    auto lgu = make_lora(x2, M, H, A_gu, B_gu, idx, a_of_gu, {0, I, N2}, scale);
+    auto ldn = make_lora(x2, M, I, A_dn, B_dn, idx, {0}, {0, Hn}, scale);
+    auto& q = queue_of(x2);
+    const int Mp = 8, S = gu_suh.size(0);
+    auto out = at::empty({M, Hn}, x2.options());
+    auto xh = at::empty({S, Mp, H}, x2.options());
+    {
+        HadInLoraKernel<fp16> k{reinterpret_cast<const fp16*>(x2.data_ptr()), reinterpret_cast<const fp16*>(gu_suh.data_ptr()),
+                                reinterpret_cast<fp16*>(xh.data_ptr()), M, H, S, (int)x2.stride(0), Mp, 0, lgu.first};
+        int n = S * Mp * (H / 128);
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), k); });
+    }
+    at::Tensor part = K_gu == 4 ? dpas8_parts<4>(xh, gu_tr, gu_shard, M, H, N2, q) : dpas8_parts<6>(xh, gu_tr, gu_shard, M, H, N2, q);
+    auto xh2 = at::empty({1, Mp, I}, x2.options());
+    MlpMidLoraKernel mk{part.data_ptr<float>(), (int)part.size(0), M, I, reinterpret_cast<const fp16*>(gu_svh.data_ptr()),
+                        reinterpret_cast<const fp16*>(dn_suh.data_ptr()), reinterpret_cast<fp16*>(xh2.data_ptr()), Mp,
+                        lgu.first, ldn.first};
+    int n = Mp * (I / 128);
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, 8), 8), mk); });
+    at::Tensor part2 = K_dn == 4 ? dpas8_parts<4>(xh2, dn_tr, dn_shard, M, I, Hn, q) : dpas8_parts<6>(xh2, dn_tr, dn_shard, M, I, Hn, q);
+    {
+        HadOutLoraKernel k{part2.data_ptr<float>(), reinterpret_cast<const fp16*>(dn_svh.data_ptr()),
+                           reinterpret_cast<fp16*>(out.data_ptr()), M, Hn, (int)part2.size(0), (int)out.stride(0), ldn.first};
+        int n2 = M * (Hn / 128);
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n2, 8), 8), k); });
+    }
+    return out;
+}
 at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
                        std::vector<int64_t> group_bounds, int64_t K, int64_t cb, int64_t small_m_max, int64_t slice_n);
 // Whole MLP (gate_up -> silu*mul -> down) as one op, decided at run time (vLLM traces the model once with a symbolic
@@ -1885,6 +2002,10 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.impl("mlp_small", torch::kXPU, &exl3_mlp_small_f);
     m.def("mlp_auto(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, int[] gu_bounds, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, int[] dn_bounds, int K_gu, int K_dn, int cb, int small_m_max, int slice_n) -> Tensor");
     m.impl("mlp_auto", torch::kXPU, &exl3_mlp_auto);
+    m.def("linear_lora(Tensor x, Tensor trellis, Tensor suh, Tensor svh, Tensor shard_of_nb, int K, int cb, Tensor[] A, Tensor[] B, Tensor idx, int[] a_of_slice, int[] slice_off, float scale) -> Tensor");
+    m.impl("linear_lora", torch::kXPU, &exl3_linear_lora);
+    m.def("mlp_small_lora(Tensor x, Tensor gu_tr, Tensor gu_suh, Tensor gu_svh, Tensor gu_shard, Tensor dn_tr, Tensor dn_suh, Tensor dn_svh, Tensor dn_shard, int K_gu, int K_dn, Tensor[] A_gu, Tensor[] B_gu, int[] a_of_gu, Tensor[] A_dn, Tensor[] B_dn, Tensor idx, float scale) -> Tensor");
+    m.impl("mlp_small_lora", torch::kXPU, &exl3_mlp_small_lora);
     m.def("exl3_draft_sample(Tensor logits, Tensor temperature, Tensor(a!) probs, Tensor(b!) token, int seed, int offset) -> ()");
     m.impl("exl3_draft_sample", torch::kXPU, &exl3_draft_sample);
     m.def("exl3_draft_sample_sub(Tensor logits, Tensor idx, Tensor temperature, Tensor(a!) probs, Tensor(b!) token, Tensor ctr, int seed, int salt) -> ()");
