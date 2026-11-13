@@ -17,7 +17,8 @@ import torch
 from safetensors import safe_open
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-torch.ops.load_library(os.environ.get("LK_C", os.path.join(HERE, "_C_lora.so")))
+_DEF = os.path.join(HERE, "_C_lora.so")
+torch.ops.load_library(os.environ.get("LK_C", _DEF if os.path.exists(_DEF) else os.path.join(HERE, "_C.so")))
 C = torch.ops.exl3xpu_C
 MODEL = os.environ.get("MODEL", "/models/turboderp-Qwen3.8-27B-exl3-4.00bpw")
 dev = torch.device("xpu")
