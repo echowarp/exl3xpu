@@ -77,10 +77,47 @@ def linear_full(layer, x):
         return None
     base = layer.base_layer
     idx = layer.punica_wrapper._token_lora_indices[:M]
+    uniq, a_of = _a_groups(layer, a)
     _N["linear"] += 1
     return torch.ops.exl3xpu_C.linear_lora(x, base.trellis, base.suh, base.svh, base.exl3_shard_of_nb,
-                                           int(base.exl3_K), int(base.exl3_cb), list(a), list(bb), idx,
-                                           list(range(len(a))), off, 1.0)
+                                           int(base.exl3_K), int(base.exl3_cb), uniq, list(bb), idx, a_of, off, 1.0)
+
+
+def _capturing():
+    f = getattr(torch.xpu, "is_current_stream_capturing", None)
+    try:
+        return True if f is None else bool(f())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _a_groups(layer, a):
+    """Distinct A tensors + slice -> A map. vLLM's expand_packed_lora copies one checkpoint A into every slice its
+    group covers (in_proj_qkv -> the q, k, v slices of in_proj_qkvz), so equal slices stay equal for any adapter: decided
+    once per layer by comparing the slot buffers (first call outside graph capture; before that: no dedup, still exact)."""
+    g = getattr(layer, "_llmt_lk_ag", None)
+    if g is not None and g[0] == tuple(t.data_ptr() for t in a):
+        return [a[i] for i in g[1]], g[2]
+    if len(a) == 1:
+        res = ([0], [0])
+    elif _capturing():
+        return list(a), list(range(len(a)))
+    else:
+        # an all-zero slice matches anything: without data in every slice, keep the exact no-dedup plan (cached)
+        reps, a_of = [], []
+        if not all(bool(t.any()) for t in a):
+            reps, a_of = list(range(len(a))), list(range(len(a)))
+        for i, t in enumerate(a if not reps else []):
+            for j, r in enumerate(reps):
+                if a[r].shape == t.shape and torch.equal(a[r], t):
+                    a_of.append(j)
+                    break
+            else:
+                reps.append(i)
+                a_of.append(len(reps) - 1)
+        res = (reps, a_of)
+    layer._llmt_lk_ag = (tuple(t.data_ptr() for t in a), res[0], res[1])
+    return [a[i] for i in res[0]], res[1]
 
 
 def mlp(module, x):

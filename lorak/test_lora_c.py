@@ -128,9 +128,20 @@ def check():
         slices = slices or lin.sizes
         assert sum(slices) == lin.n, (name, slices, lin.n)
         a, b = adapter(lin.k, slices)
+        if name == "gdn.in_proj_qkvz":    # vLLM: in_proj_qkv's A copied into the q, k, v slices
+            a = [a[0], a[0].clone(), a[0].clone(), a[3]]
         for rows in (1, 2, 3, 4, 6, 8, 16, 32):
             x = torch.randn(rows, lin.k, device=dev, dtype=dt)
             base = lin(x)
+            if name == "gdn.in_proj_qkvz":
+                idx = mapping("three", rows)
+                y4 = lin_lora(lin, x, a, b, idx)
+                y2 = C.linear_lora(x, lin.trellis, lin.suh, lin.svh, lin.shard, lin.K, lin.cb, [a[0], a[3]], b, idx,
+                                   [0, 0, 0, 1], offs(slices), 1.0)
+                same = bool((y4 == y2).all())
+                bad += not same
+                if not same or rows in (1, 8):
+                    print(f"{name:17s} rows {rows:2d} deduped A (2 of 4) bit-identical to 4 A: {same}")
             for kind in ("none", "mix", "one", "three"):
                 idx = mapping(kind, rows)
                 y = lin_lora(lin, x, a, b, idx)

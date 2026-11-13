@@ -69,7 +69,10 @@ ESIMD_INLINE simd<float, 128> lora_expand_block(const LoraArgs& la, int s, int a
     simd<float, 128> d = 0.0f;
 #pragma unroll
     for (int c = 0; c < 4; ++c) {   // 32 columns x 16 ranks per load
-        simd<float, 32 * LR> bf = convert<float>(block_load<fp16, 32 * LR>(b + c * 32 * LR));
+        simd<fp16, 32 * LR> bh;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) bh.template select<128, 1>(q * 128) = block_load<fp16, 128>(b + c * 32 * LR + q * 128);
+        simd<float, 32 * LR> bf = convert<float>(bh);
         simd<float, 32> acc = 0.0f;
 #pragma unroll
         for (int r = 0; r < LR; ++r) acc += bf.template select<32, LR>(r) * h[r];
