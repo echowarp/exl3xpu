@@ -18,6 +18,10 @@ namespace exl3 {
 
 constexpr int LR = 16;   // LoRA rank handled here
 constexpr int LMAXG = 4, LMAXS = 4;
+#ifndef LORA_LKC
+#define LORA_LKC 4
+#endif
+constexpr int LKC = LORA_LKC;   // k blocks (of 128) per shrink thread in had_in
 
 struct LoraArgs {
     const fp16* A[LMAXG]; int64_t as[LMAXG];   // distinct A_j: [L, 1, 16, K] (adapter stride as[j], rank row stride K)
@@ -95,9 +99,24 @@ struct HadInLoraKernel {
     int M, Kdim, S, x_stride, Mp;
     int row_major;
     LoraArgs la;
+    int n_base;   // threads [0, n_base) = HadIn; [n_base, n_base + G * KB * 16) = shrink, one (A_j, k block, rank r) each
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         int id = it.get_global_id(0);
         int kb_n = Kdim / 128;
+        if (id >= n_base) {   // shrink thread: (A_j, chunk of LKC k blocks, row m, rank r); la.KB = number of chunks
+            int t = id - n_base, r = t % LR, m = (t / LR) % M, c = (t / (LR * M)) % la.KB, j = t / (LR * M * la.KB);
+            if (j >= la.G) return;
+            int ad = lora_slot(la, m);
+            if (ad < 0) return;
+            int kb0 = c * LKC, kb1 = kb0 + LKC < kb_n ? kb0 + LKC : kb_n;
+            const fp16* a = la.A[j] + (int64_t)ad * la.as[j] + (int64_t)r * Kdim;
+            simd<float, 128> acc = 0.0f;
+            for (int kb = kb0; kb < kb1; ++kb)
+                acc += convert<float>(block_load<TIn, 128>(x + (size_t)m * x_stride + kb * 128)) *
+                       convert<float>(block_load<fp16, 128>(a + kb * 128));
+            la.lp[(((size_t)j * la.KB + c) * M + m) * LR + r] = reduce<float>(acc, std::plus<>());
+            return;
+        }
         int kb = id % kb_n;
         int rows = row_major ? M : Mp;
         int m = (id / kb_n) % rows;
@@ -112,10 +131,6 @@ struct HadInLoraKernel {
             return;
         }
         simd<TIn, 128> xi = block_load<TIn, 128>(x + (size_t)m * x_stride + kb * 128);
-        if (g == 0) {
-            int ad = lora_slot(la, m);
-            if (ad >= 0) lora_shrink_block(la, ad, m, M, kb, Kdim, convert<float>(xi));
-        }
         simd<fp16, 128> su = block_load<fp16, 128>(suh + (size_t)g * Kdim + kb * 128);
         simd<float, 128> v = convert<float>(xi) * convert<float>(su);
         v = convert<float>(convert<fp16>(v));
@@ -144,6 +159,13 @@ struct HadOutLoraKernel {
         int nb = id % nb_n;
         int m = id / nb_n;
         if (m >= M) return;
+        // LoRA delta first (its loads are independent of the base partials; issued before the base loop)
+        int ad = lora_slot(la, m);
+        simd<float, 128> dl = 0.0f;
+        if (ad >= 0) {
+            int n = nb * 128, s = lora_slice_of(la, n);
+            dl = lora_expand_block(la, s, ad, n - la.off[s], lora_h(la, la.ga[s], m, M));
+        }
         simd<float, 128> v = 0.0f;
 #ifdef EXL3_HADOUT_B
         constexpr int HB = EXL3_HADOUT_B;
@@ -169,11 +191,7 @@ struct HadOutLoraKernel {
         simd<fp16, 128> sv = block_load<fp16, 128>(svh + nb * 128);
 #endif
         v = v * kRsqrt128 * convert<float>(sv);
-        int ad = lora_slot(la, m);
-        if (ad >= 0) {
-            int n = nb * 128, s = lora_slice_of(la, n);
-            v += lora_expand_block(la, s, ad, n - la.off[s], lora_h(la, la.ga[s], m, M));
-        }
+        if (ad >= 0) v += dl;
         block_store<fp16, 128>(out + (size_t)m * out_stride + nb * 128, convert<fp16>(v));
     }
 };

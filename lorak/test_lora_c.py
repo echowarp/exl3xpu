@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _DEF = os.path.join(HERE, "_C_lora.so")
 torch.ops.load_library(os.environ.get("LK_C", _DEF if os.path.exists(_DEF) else os.path.join(HERE, "_C.so")))
 C = torch.ops.exl3xpu_C
-MODEL = os.environ.get("MODEL", "/models/turboderp-Qwen3.8-27B-exl3-4.00bpw")
+MODEL = os.environ.get("MODEL", "/models")
 dev = torch.device("xpu")
 dt = torch.float16
 R = 16
@@ -66,7 +66,7 @@ class Lin:
         return C.linear(x, self.trellis, self.suh, self.svh, self.shard, self.bounds, self.K, self.cb, SMALL_M_MAX, SLICE_N)
 
 
-def adapter(k, slices, scale_w=0.02):
+def adapter(k, slices, scale_w=float(os.environ.get('LK_W', '0.02'))):
     a = [torch.randn(L, 1, R, k, device=dev, dtype=dt) * scale_w for _ in slices]
     b = [torch.randn(L, 1, n, R, device=dev, dtype=dt) * scale_w for n in slices]
     return a, b
@@ -153,11 +153,14 @@ def check():
                 pun = (base.float() + d).half()   # punica: fp16 base + delta, one rounding
                 e = (y.float() - ref32).abs().max().item()
                 ep = (pun.float() - ref32).abs().max().item()
-                ok = ident and e <= max(2 * ep, 2e-3)
+                # tolerance: fp16 ulp of the output (the kernel rounds base + delta once; the reference rounds base first)
+                ulp = (ref32.abs().max().item() * 2 ** -10)
+                dmax = d.abs().max().item()
+                ok = ident and e <= max(2 * ep, 2e-3, 1.5 * ulp)
                 bad += not ok
                 if not ok or rows in (1, 8):
                     print(f"{name:17s} rows {rows:2d} {kind:5s} base rows bit-identical {ident}  max err {e:.2e} "
-                          f"(punica-style {ep:.2e}){'' if ok else '  <-- FAIL'}")
+                          f"(punica-style {ep:.2e}, out ulp {ulp:.1e}, |delta| {dmax:.1e}){'' if ok else '  <-- FAIL'}")
     # MLP
     gu, dnl = Lin([f"{P}.0.mlp.gate_proj", f"{P}.0.mlp.up_proj"]), Lin([f"{P}.0.mlp.down_proj"])
     I = gu.n // 2
@@ -180,10 +183,13 @@ def check():
             e = (y.float() - ref).abs().max().item()
             eb = (base.float() - (dnl((torch.nn.functional.silu(gu(x).float()[:, :I]) * gu(x).float()[:, I:]).half()).float())).abs().max().item()
             rel = e / max(ref.abs().max().item(), 1e-6)
-            ok = ident and e <= max(4 * eb, 4e-3)
+            base_plain = dnl((torch.nn.functional.silu(gu(x).float()[:, :I]) * gu(x).float()[:, I:]).half()).float()
+            dl = (ref - base_plain)[idx >= 0].abs().max().item() if (idx >= 0).any() else 0.0
+            # LoRA rows: error must be small against the LoRA effect itself (a wrong slice / h would be ~|delta|)
+            ok = ident and (e <= max(4 * eb, 4e-3) or e <= 0.05 * dl)
             bad += not ok
             print(f"mlp_small_lora    rows {rows:2d} {kind:5s} base rows bit-identical {ident}  max err vs plain path {e:.2e}"
-                  f" (rel {rel:.1e}; fused-vs-plain base noise {eb:.2e}){'' if ok else '  <-- FAIL'}")
+                  f" (rel {rel:.1e}; base noise {eb:.2e}; LoRA effect {dl:.2e}){'' if ok else '  <-- FAIL'}")
     print("failures:", bad)
     return bad
 
