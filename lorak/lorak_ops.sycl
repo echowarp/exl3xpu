@@ -1,0 +1,374 @@
+// LoRA delta kernels for decode-sized batches on the Arc B70 (llm-tuning, 2026-11-13). Separate torch library "llmt_lk"
+// (like ng.so): the production exl3xpu_C build is untouched.
+//
+//   llmt_lk::lora_delta(y, x, A[], B[], idx, a_of_slice, slice_off, scale)
+//     y[m, off_s + n] += scale * sum_r B_s[idx[m], 0, n, r] * (sum_k A_{a(s)}[idx[m], 0, r, k] * x[m, k])
+//   for every row m with idx[m] >= 0 (rows with idx < 0 are not touched). The tensors are the slot buffers vLLM keeps
+//   (lora_a_stacked [L, 1, R, K], lora_b_stacked [L, 1, N_s, R], fp16), so no weight re-layout. a_of_slice maps each
+//   output slice to one of the distinct A tensors: vLLM duplicates in_proj_qkv's A into the q, k, v slices of
+//   in_proj_qkvz; the shrink is computed once per distinct A.
+//
+// Two kernels per call, no host sync, no allocation after the workspace is sized (graph capturable):
+//   1. shrink: work-group per (distinct A, K chunk of 512, 16-row tile); sub-group r computes rank row r (16 lanes x 8
+//      fp16 per load, fp32 accumulate), partials [G][P][M][R]; the last work-group to finish (atomic counter, the
+//      last-arriver pattern of ng.so) sums the partials into h[G][M][R] and resets the counter.
+//   2. expand: one work-item per output column (B row = R fp16 = one 32-byte load for R = 16), h in SLM, y RMW in fp32.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <vector>
+
+using fp16 = sycl::half;
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+constexpr int MAXG = 4, MAXS = 4, MT = 16, LANES = 16;
+static int g_mask = 3, g_ck = 256; static bool g_nolast = true, g_atom = false, g_fused = false;   // lab knobs: phase mask (1 shrink, 2 expand), K chunk
+void lk_set(int64_t mask, int64_t ck) { g_mask = (int)(mask & 3); g_ck = (int)ck; g_nolast = !(mask & 12); g_atom = (mask & 4) != 0; g_fused = (mask & 32) != 0; }
+
+struct Ws {   // per device workspace
+    at::Tensor part, h, cnt;
+};
+static std::vector<Ws> g_ws(16);
+static Ws& ws_for(const at::Tensor& like, int64_t part_n, int64_t h_n) {
+    auto& w = g_ws.at(like.device().index());
+    auto fo = like.options().dtype(at::kFloat);
+    if (!w.part.defined() || w.part.numel() < part_n) w.part = at::empty({std::max<int64_t>(part_n, 1 << 16)}, fo);
+    if (!w.h.defined() || w.h.numel() < h_n) w.h = at::zeros({std::max<int64_t>(h_n, 1 << 12)}, fo);
+    if (!w.cnt.defined()) w.cnt = at::zeros({64}, like.options().dtype(at::kInt));
+    return w;
+}
+
+template <typename I>
+static inline int row_ad(const I* idx, int m) { return (int)idx[m]; }
+
+template <int R, typename I, int CK>
+struct ShrinkKernel {
+    const fp16* x; int64_t xs;               // x [M, K], row stride xs
+    const fp16* A[MAXG]; int64_t as[MAXG];   // A_g [L, 1, R_slot, K]: adapter stride as[g], rank row stride K
+    const I* idx;
+    float* part; float* h; uint32_t* cnt;
+    int M, K, P, NT, G; bool NOLAST, ATOM;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const { body(it, it.get_group(0)); }
+    void body(sycl::nd_item<1> it, int wg) const {
+        const int nwg = G * P * NT;
+        const int mt = wg % NT, p = (wg / NT) % P, g = wg / (NT * P);
+        const int t = it.get_local_id(0), r = t / LANES, l = t % LANES;
+        auto sg = it.get_sub_group();
+        const int m0 = mt * MT, m1 = sycl::min(M, m0 + MT);
+        const int k0 = p * CK;
+        float acc[MT];
+#pragma unroll
+        for (int i = 0; i < MT; ++i) acc[i] = 0.f;
+        const fp16* Ag = A[g] + (int64_t)r * K;
+#pragma unroll
+        for (int j = 0; j < CK / (LANES * 8); ++j) {
+            const int k = k0 + j * LANES * 8 + l * 8;
+            if (k >= K) break;
+            int cur = -1;
+            sycl::vec<fp16, 8> a8;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int m = m0 + i;
+                if (m >= m1) break;
+                const int ad = row_ad(idx, m);
+                if (ad < 0) continue;
+                if (ad != cur) { a8 = *reinterpret_cast<const sycl::vec<fp16, 8>*>(Ag + ad * as[g] + k); cur = ad; }
+                auto x8 = *reinterpret_cast<const sycl::vec<fp16, 8>*>(x + (int64_t)m * xs + k);
+                float s = 0.f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) s += (float)x8[e] * (float)a8[e];
+                acc[i] += s;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MT; ++i) {
+            const int m = m0 + i;
+            if (m >= m1) break;
+            float v = sycl::reduce_over_group(sg, acc[i], sycl::plus<float>());
+            if (l == 0) {
+                if (ATOM) {
+                    if (row_ad(idx, m) >= 0) {
+                        sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space> ra(h[((int64_t)g * M + m) * R + r]);
+                        ra.fetch_add(v);
+                    }
+                } else part[(((int64_t)g * P + p) * M + m) * R + r] = v;
+            }
+        }
+        if (NOLAST || ATOM) return;
+        // last arriver sums the partials
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+        auto grp = it.get_group();
+        sycl::group_barrier(grp, sycl::memory_scope::device);
+        int* last = sycl::ext::oneapi::group_local_memory_for_overwrite<int>(grp).get();
+        if (t == 0) {
+            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space> c(cnt[0]);
+            uint32_t prev = c.fetch_add(1u);
+            *last = prev == (uint32_t)nwg - 1;
+            if (*last) c.store(0u);
+        }
+        sycl::group_barrier(grp, sycl::memory_scope::device);
+        if (!*last) return;
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+        const int tot = G * M * R, WG = R * LANES;
+        for (int o = t; o < tot; o += WG) {
+            const int gg = o / (M * R), mr = o % (M * R), m = mr / R;
+            if (row_ad(idx, m) < 0) continue;
+            float s = 0.f;
+            for (int q = 0; q < P; ++q) s += part[((int64_t)gg * P + q) * M * R + mr];
+            h[o] = s;
+        }
+    }
+};
+
+template <int R, typename I, int CPW>
+struct ExpandKernel {
+    fp16* y; int64_t ys;                       // y [M, N_total]
+    const fp16* B[MAXS]; int64_t bs[MAXS];     // B_s [L, 1, N_s, R]: adapter stride bs[s], row stride R
+    int off[MAXS + 1]; int ga[MAXS];           // slice column offsets; A group of each slice
+    const I* idx; float* h; const float* part; int PP; uint32_t* cnt; bool ZERO;   // PP > 0: h = sum of PP partials [G][PP][M][R]
+    int M, G, S; float scale;
+    sycl::local_accessor<float, 1> hs, red_;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        body(it, it.get_group(0), it.get_group_range(0));
+    }
+    void body(sycl::nd_item<1> it, int e, int ne) const {
+        auto grp = it.get_group();
+        const int t = it.get_local_id(0), WG = it.get_local_range(0);
+        const int tot = G * M * R;
+        if (PP == 0) {
+            for (int o = t; o < tot; o += WG) {
+                const int m = (o / R) % M;
+                hs[o] = row_ad(idx, m) >= 0 ? h[o] * scale : 0.f;
+            }
+        } else {
+            // sum of PP partials: (output, partial-group) pairs over the work-group, independent loads, SLM combine
+            const int MR = M * R, QG = sycl::max(1, WG / tot);
+            float* red = &red_[0];
+            for (int w = t; w < tot * QG; w += WG) {
+                const int o = w % tot, qg = w / tot, gg = o / MR, mr = o % MR;
+                float v = 0.f;
+                if (row_ad(idx, mr / R) >= 0) {
+                    const float* pp = part + (int64_t)gg * PP * MR + mr;
+#pragma unroll 8
+                    for (int q = qg; q < PP; q += QG) v += pp[(int64_t)q * MR];
+                }
+                if (QG == 1) hs[o] = v * scale; else red[qg * tot + o] = v;
+            }
+            if (QG > 1) {
+                sycl::group_barrier(grp);
+                for (int o = t; o < tot; o += WG) {
+                    float v = 0.f;
+                    for (int qg = 0; qg < QG; ++qg) v += red[qg * tot + o];
+                    hs[o] = v * scale;
+                }
+            }
+        }
+        sycl::group_barrier(grp);
+        if (ZERO) {   // h is read (in SLM) by every work-group: the last one to get here zeroes it for the next call
+            int* last = sycl::ext::oneapi::group_local_memory_for_overwrite<int>(grp).get();
+            if (t == 0) {
+                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space> c(cnt[1]);
+                uint32_t prev = c.fetch_add(1u);
+                *last = prev == (uint32_t)ne - 1;
+                if (*last) c.store(0u);
+            }
+            sycl::group_barrier(grp);
+            if (*last)
+                for (int o = t; o < tot; o += WG) h[o] = 0.f;
+        }
+        const int n0 = (e * WG + t) * CPW;
+#pragma unroll
+        for (int c = 0; c < CPW; ++c) {
+            const int n = n0 + c;
+            if (n >= off[S]) return;
+            int s = 0;
+#pragma unroll
+            for (int q = 1; q < MAXS; ++q) s += (q < S && n >= off[q]) ? 1 : 0;
+            const int nl = n - off[s];
+            const fp16* Bs = B[s] + (int64_t)nl * R;
+            const int hg = ga[s] * M * R;
+            int cur = -1;
+            float b[R];
+            for (int m = 0; m < M; ++m) {
+                const int ad = row_ad(idx, m);
+                if (ad < 0) continue;
+                if (ad != cur) {
+#pragma unroll
+                    for (int e = 0; e < R; e += 8) {
+                        auto b8 = *reinterpret_cast<const sycl::vec<fp16, 8>*>(Bs + ad * bs[s] + e);
+#pragma unroll
+                        for (int u = 0; u < 8; ++u) b[e + u] = (float)b8[u];
+                    }
+                    cur = ad;
+                }
+                float d = 0.f;
+#pragma unroll
+                for (int e = 0; e < R; ++e) d += b[e] * hs[hg + m * R + e];
+                fp16* yp = y + (int64_t)m * ys + n;
+                *yp = (fp16)((float)*yp + d);
+            }
+        }
+    }
+};
+
+
+// One launch per call (R = 16: both phases use 256-item work-groups): work-groups [0, NS) shrink and count themselves
+// done on cnt[2]; work-groups [NS, NS + NE) expand after waiting for cnt[2] == NS (work-groups are dispatched in id
+// order, so every shrink group is running or done before an expand group can occupy a slot; the wait is bounded and
+// flags cnt[3] if it ever times out). The last expand group resets the counters for the next call.
+template <int R, typename I>
+struct FusedKernel {
+    ShrinkKernel<R, I, 256> ks;
+    ExpandKernel<R, I, 1> ke;
+    int NS, NE;
+    uint32_t* cnt;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        const int wg = it.get_group(0), t = it.get_local_id(0);
+        auto grp = it.get_group();
+        if (wg < NS) {
+            ks.body(it, wg);
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+            sycl::group_barrier(grp, sycl::memory_scope::device);
+            if (t == 0) {
+                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space> c(cnt[2]);
+                c.fetch_add(1u);
+            }
+            return;
+        }
+        if (t == 0) {
+            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space> c(cnt[2]);
+            uint32_t spins = 0;
+            while (c.load() < (uint32_t)NS) {
+                if (++spins > (1u << 26)) {
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space> f(cnt[3]);
+                    f.store(1u);
+                    break;
+                }
+            }
+        }
+        sycl::group_barrier(grp, sycl::memory_scope::device);
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+        if (t == 0) {   // every expand group is past its wait when the last one arrives here: reset for the next call
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space> a(cnt[1]), d(cnt[2]);
+            if (a.fetch_add(1u) == (uint32_t)NE - 1) { a.store(0u); d.store(0u); }
+        }
+        ke.body(it, wg - NS, NE);
+    }
+};
+
+template <int R, typename I, int CK>
+static void run_shrink(sycl::queue& q, const at::Tensor& x, const std::vector<at::Tensor>& A, const at::Tensor& idx,
+                       float* part, float* h, uint32_t* cnt) {
+    const int M = x.size(0), K = x.size(1), G = A.size();
+    const int P = (K + CK - 1) / CK, NT = (M + MT - 1) / MT;
+    ShrinkKernel<R, I, CK> ks{};
+    ks.x = reinterpret_cast<const fp16*>(x.data_ptr()); ks.xs = x.stride(0);
+    for (int g = 0; g < G; ++g) { ks.A[g] = reinterpret_cast<const fp16*>(A[g].data_ptr()); ks.as[g] = A[g].stride(0); }
+    ks.idx = reinterpret_cast<const I*>(idx.data_ptr());
+    ks.part = part; ks.h = h; ks.cnt = cnt;
+    ks.M = M; ks.K = K; ks.P = P; ks.NT = NT; ks.G = G; ks.NOLAST = g_nolast; ks.ATOM = g_atom;
+    const int WG1 = R * LANES;
+    q.submit([&](sycl::handler& hd) { hd.parallel_for(sycl::nd_range<1>((size_t)G * P * NT * WG1, WG1), ks); });
+}
+template <int R, typename I>
+static void run(at::Tensor& y, const at::Tensor& x, const std::vector<at::Tensor>& A, const std::vector<at::Tensor>& B,
+                const at::Tensor& idx, const std::vector<int64_t>& a_of, const std::vector<int64_t>& soff, double scale) {
+    auto& q = queue_of(x);
+    const int M = x.size(0), K = x.size(1), G = A.size(), S = B.size();
+    const int P = (K + 127) / 128;
+    auto& w = ws_for(x, (int64_t)G * P * M * R, (int64_t)G * M * R);
+    float* hp = w.h.data_ptr<float>();
+    const bool fused = g_fused && R == 16 && g_nolast && !g_atom && g_mask == 3;
+    if ((g_mask & 1) && !fused) {
+        float* pp = w.part.data_ptr<float>(); auto* cp = reinterpret_cast<uint32_t*>(w.cnt.data_ptr());
+        if (g_ck == 128) run_shrink<R, I, 128>(q, x, A, idx, pp, hp, cp);
+        else if (g_ck == 256) run_shrink<R, I, 256>(q, x, A, idx, pp, hp, cp);
+        else run_shrink<R, I, 512>(q, x, A, idx, pp, hp, cp);
+    }
+    if (!(g_mask & 2)) return;
+    constexpr int CPW = 1, WG2 = 256;
+    ExpandKernel<R, I, CPW> ke{};
+    ke.y = reinterpret_cast<fp16*>(y.data_ptr()); ke.ys = y.stride(0);
+    for (int s = 0; s < S; ++s) {
+        ke.B[s] = reinterpret_cast<const fp16*>(B[s].data_ptr()); ke.bs[s] = B[s].stride(0);
+        ke.off[s] = soff[s]; ke.ga[s] = a_of[s];
+    }
+    ke.off[S] = soff[S];
+    for (int s = S + 1; s <= MAXS; ++s) ke.off[s] = soff[S];
+    ke.idx = reinterpret_cast<const I*>(idx.data_ptr()); ke.h = hp; ke.part = w.part.data_ptr<float>(); ke.cnt = reinterpret_cast<uint32_t*>(w.cnt.data_ptr()); ke.ZERO = g_atom;
+    ke.PP = (g_nolast && !g_atom) ? (K + g_ck - 1) / g_ck : 0; ke.M = M; ke.G = G; ke.S = S; ke.scale = (float)scale;
+    const int64_t N = soff[S], nwg = (N + (int64_t)WG2 * CPW - 1) / ((int64_t)WG2 * CPW);
+    if (fused) {
+        ke.PP = (K + 255) / 256;
+        FusedKernel<R, I> fk{};
+        auto& ks = fk.ks;
+        ks.x = reinterpret_cast<const fp16*>(x.data_ptr()); ks.xs = x.stride(0);
+        for (int g = 0; g < G; ++g) { ks.A[g] = reinterpret_cast<const fp16*>(A[g].data_ptr()); ks.as[g] = A[g].stride(0); }
+        ks.idx = ke.idx; ks.part = w.part.data_ptr<float>(); ks.h = hp; ks.cnt = ke.cnt;
+        ks.M = M; ks.K = K; ks.P = ke.PP; ks.NT = (M + MT - 1) / MT; ks.G = G; ks.NOLAST = true; ks.ATOM = false;
+        ke.ZERO = false;
+        fk.NS = G * ks.P * ks.NT; fk.NE = (int)nwg; fk.cnt = ke.cnt;
+        q.submit([&](sycl::handler& hd) {
+            fk.ke = ke;
+            fk.ke.hs = sycl::local_accessor<float, 1>(sycl::range<1>((size_t)G * M * R), hd);
+            fk.ke.red_ = sycl::local_accessor<float, 1>(sycl::range<1>((size_t)std::max(WG2, G * M * R)), hd);
+            hd.parallel_for(sycl::nd_range<1>((size_t)(fk.NS + fk.NE) * WG2, WG2), fk);
+        });
+        return;
+    }
+    q.submit([&](sycl::handler& hd) {
+        ke.hs = sycl::local_accessor<float, 1>(sycl::range<1>((size_t)G * M * R), hd);
+        ke.red_ = sycl::local_accessor<float, 1>(sycl::range<1>((size_t)std::max(WG2, G * M * R)), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t)nwg * WG2, WG2), ke);
+    });
+}
+
+// y [M, N] fp16 (row stride free, unit column stride); x [M, K] fp16; A[g] [L, 1, R, K]; B[s] [L, 1, N_s, R];
+// idx [>= M] int32/int64 (first M used); a_of_slice [S] in [0, G); slice_off [S + 1] (column offsets in y). M <= 64.
+void lora_delta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> A, std::vector<at::Tensor> B, at::Tensor idx,
+                std::vector<int64_t> a_of, std::vector<int64_t> soff, double scale) {
+    const int G = A.size(), S = B.size();
+    TORCH_CHECK(G >= 1 && G <= MAXG && S >= 1 && S <= MAXS && (int)a_of.size() == S && (int)soff.size() == S + 1);
+    TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1 && x.scalar_type() == at::kHalf && y.dim() == 2 && y.stride(1) == 1 &&
+                y.scalar_type() == at::kHalf && y.size(0) == x.size(0));
+    const int M = x.size(0), K = x.size(1);
+    TORCH_CHECK(M <= 64 && G * M * A[0].size(2) <= 6144, "lora_delta: M <= 64 and G * M * R <= 6144 per call");
+    TORCH_CHECK(K % 8 == 0 && x.stride(0) % 8 == 0, "lora_delta: K, x row stride multiple of 8");
+    TORCH_CHECK(soff[S] <= y.size(1));
+    if (M == 0) return;
+    const int R = A[0].size(2);
+    for (int g = 0; g < G; ++g)
+        TORCH_CHECK(A[g].scalar_type() == at::kHalf && A[g].dim() == 4 && A[g].size(2) == R && A[g].size(3) == K &&
+                    A[g].stride(3) == 1 && A[g].stride(2) == K && A[g].stride(0) % 8 == 0, "lora_delta: A layout");
+    for (int s = 0; s < S; ++s)
+        TORCH_CHECK(B[s].scalar_type() == at::kHalf && B[s].dim() == 4 && B[s].size(3) == R && B[s].stride(3) == 1 &&
+                    B[s].stride(2) == R && B[s].stride(0) % 8 == 0 && B[s].size(2) == soff[s + 1] - soff[s] &&
+                    a_of[s] >= 0 && a_of[s] < G, "lora_delta: B layout");
+    TORCH_CHECK(idx.dim() == 1 && idx.size(0) >= M && idx.stride(0) == 1);
+    const bool i32 = idx.scalar_type() == at::kInt;
+    TORCH_CHECK(i32 || idx.scalar_type() == at::kLong);
+#define LK_RUN(RR)                                                                  \
+    if (R == RR) {                                                                  \
+        if (i32) run<RR, int32_t>(y, x, A, B, idx, a_of, soff, scale);              \
+        else run<RR, int64_t>(y, x, A, B, idx, a_of, soff, scale);                  \
+        return;                                                                     \
+    }
+    LK_RUN(8) LK_RUN(16) LK_RUN(32) LK_RUN(64)
+#undef LK_RUN
+    TORCH_CHECK(false, "lora_delta: rank 8/16/32/64");
+}
+
+TORCH_LIBRARY(llmt_lk, m) {
+    m.def("lora_delta(Tensor(a!) y, Tensor x, Tensor[] A, Tensor[] B, Tensor idx, int[] a_of_slice, int[] slice_off, float scale) -> ()");
+    m.impl("lora_delta", torch::kXPU, &lora_delta);
+    m.def("lk_set(int mask, int ck) -> ()", &lk_set);
+    m.def("lk_flags() -> int", +[]() -> int64_t { return 0; });
+}
