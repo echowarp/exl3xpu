@@ -1,4 +1,4 @@
-// LoRA delta kernels for decode-sized batches on the Arc B70 (llm-tuning, 2026-11-13). Separate torch library "llmt_lk"
+// LoRA delta kernels for decode-sized batches on the Arc B70. Separate torch library "llmt_lk"
 // (like ng.so): the production exl3xpu_C build is untouched.
 //
 //   llmt_lk::lora_delta(y, x, A[], B[], idx, a_of_slice, slice_off, scale)

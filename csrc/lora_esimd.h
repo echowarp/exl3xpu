@@ -1,5 +1,5 @@
 #pragma once
-// LoRA terms inside the EXL3 small-M linear and fused decode MLP (llm-tuning 2026-11-13, branch lora-kernels).
+// LoRA terms inside the EXL3 small-M linear and fused decode MLP.
 //
 // A LoRA linear on a decode step used to cost the base EXL3 linear (had_in -> GEMM -> had_out, 3 launches) + vLLM's
 // fused punica kernel (1 more launch, ~4-10 us per call in XPU graphs; 304 calls per step = 2-3 ms). Here the LoRA

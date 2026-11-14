@@ -1,4 +1,4 @@
-"""Standalone LoRA delta op (llm-tuning, 2026-11-13; superseded by the in-kernel path of llmt_lora_kernels.py, kept
+"""Standalone LoRA delta op (superseded by the in-kernel path of llmt_lora_kernels.py, kept
 for reference: 0.35-0.8 ms per decode step SLOWER than punica at 1-8 rows in graphs). API over llmt_lk.so.
 
     import lk_delta as lk
