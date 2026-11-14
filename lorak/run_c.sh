@@ -3,7 +3,7 @@
 # (read-only model mount), <= 4 GiB host RAM. Output also in lorak/out/c-<what>-HHMM.txt.
 set -uo pipefail
 cd "$(dirname "$0")"; mkdir -p out
-WHAT=${1:-all}; IMG=${IMG:-exl3xpu-l0:26.31-llmt-int8kv8}
+WHAT=${1:-all}; IMG=${IMG:?set IMG to an exl3xpu build image (docker/Dockerfile.arc)}
 PROD_C=${PROD_C:-}   # sums-prod: a reference _C.so to compare the bit sums with (optional)
 MODEL=${MODEL:?MODEL=<EXL3 checkpoint dir> (mounted read-only at /models)}
 for w in $([ "$WHAT" = all ] && echo sums-prod sums check bench || echo "$WHAT"); do
