@@ -1,4 +1,4 @@
-"""LoRA decode kernels for the Arc B70 (llm-tuning, 2026-11-13): hooks for llmt_lora (EXL3_LORA_KERNELS=llmt_lora_kernels).
+"""LoRA decode kernels for the Arc B70: hooks for the AllBroker lend manager (EXL3_LORA_KERNELS=llmt_lora_kernels).
 
 The LoRA terms run inside the kernels the EXL3 base linear launches anyway (exl3xpu_C ops of branch lora-kernels,
 csrc/lora_esimd.h), so a LoRA linear costs the base linear's 3 launches instead of 3 + punica's 1 (4-10 us each in

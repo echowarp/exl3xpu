@@ -34,6 +34,34 @@ Verified on the production image (icpx 2025.3.3, PyTorch 2.12.0+xpu): `_C.so` re
 `ng.so` rebuild with identical device code. Run the tests in `tests/` and `tests/arc/` after building with any other
 toolchain.
 
+## Scope: kernels here, memory policy in AllBroker
+
+This fork is the fast math for the Arc: ESIMD EXL3 GEMM/GEMV, fused MLP / RMSNorm, verify attention, int8 / int4 KV,
+sampling, GDN, LoRA decode kernels, and the plugin that registers them with vLLM. It does not decide what stays in GPU
+memory. That is the memory layer, [AllBroker](https://github.com/echowarp/AllBroker) (`llmt_kv` package):
+
+| Memory-policy piece | Where it lives | What this fork keeps |
+|---|---|---|
+| Weight keeper (weights stay resident across engine restarts, Level Zero IPC) | AllBroker `llmt-keeper` + engine-side `whx_loader` (XPU backend) | nothing; the XPU keeper works on the model's parameters |
+| No-mmap safetensors loader | AllBroker `llmt_kv.nommap_loader` | `exl3xpu/nommap_loader.py`, the same code; the plugin uses `llmt_kv`'s copy when it is installed and falls back to the bundled one |
+| KV lending, LoRA / vision / prefill scratch, RAM KV tier | AllBroker (`llmt_kv`, vLLM plugin + connector) | the LoRA kernels (`lorak/`, `csrc/lora_esimd.h`), which the lend manager calls through `EXL3_LORA_KERNELS=llmt_lora_kernels` |
+| Lazy vision tower | AllBroker's broker-managed version (VRAM budget shared with KV lending) | `exl3xpu/lazyvis.py`: the standalone device-only version production runs today (`EXL3_LAZY_VISION`). Kept for compatibility; with AllBroker installed, use its module instead (do not enable both) |
+
+GPU-specific settings are configuration, not code: every feature is an `EXL3_*` (LoRA kernels: `LLMT_LK_*`) variable
+listed below with its production value, and the per-shape split-K table is a data file (`EXL3_SHAPE_P_FILE`).
+
+CPU-only checks (no Arc GPU): `python tests/cpu/test_cpu_plugin.py` (or pytest; no-mmap loader round trip, loader
+preference, entry point, LoRA-hook fallback, defaults; `LLMT_KV_NOMMAP=<path>` also compares the bundled loader with
+AllBroker's). Everything else in `tests/` needs the GPU.
+
+### LoRA decode kernels (`lorak/`)
+
+The LoRA terms run inside the kernels the EXL3 base linear launches anyway (`exl3xpu_C.linear_lora`,
+`exl3xpu_C.mlp_small_lora`). `lorak/llmt_lora_kernels.py` is the hook module: `EXL3_LORA_KERNELS=llmt_lora_kernels`
+makes AllBroker's lend manager call it; each call returns `None` (stock punica path) outside what the kernels cover
+(rank 16, fp16, small-M rows). `LLMT_LK_LINEAR` (1) and `LLMT_LK_MLP` (1) switch the two paths. `lorak/run.sh` runs
+the GPU checks (`test_lorak.py check|bench|step`).
+
 ## Environment variables
 
 Production = the Qwen3.8-27B Arc B70 service (`kv_cache_dtype=int4_per_token_head`, MTP k = 7 with a dynamic depth
