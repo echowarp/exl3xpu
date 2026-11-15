@@ -11,8 +11,9 @@ Every feature is a separate commit and is switched by an environment variable (p
 the dynamic depth schedule, 196,608 context, and the production values of the switches below, except the ones
 that need a data file (`EXL3_KSMOOTH`, `EXL3_DRAFT_VOCAB_FAR`) or belong to the memory layer (`EXL3_LAZY_VISION`,
 keeper, RAM tier). `EXL3_GDN_PORT=1` loads the package's `gdnchunk.so`. GDN recompute is on by default; the companion vLLM runner
-follows the plugin's switch, and the plugin turns it off (with a warning) when that runner is not installed. The
-companion vLLM branch's own switches default to these production values on an XPU as well.
+follows the plugin's switch, and the plugin turns it off (with a warning) when that runner is not installed and,
+unless `EXL3_GDN_RECOMPUTE=1` is set, for models that are not EXL3. The companion vLLM branch's own switches default
+to these production values too, but only while this plugin serves an EXL3 model (its `docs/llmt`).
 Kernel features that are missing from a build, or vLLM internals that are not there, leave the stock path in place
 with a log line.
 

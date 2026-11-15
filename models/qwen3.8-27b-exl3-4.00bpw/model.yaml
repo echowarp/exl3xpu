@@ -86,6 +86,7 @@ env:
   EXL3_SPEC_STOP_TRUNC: "1"  # vLLM patch: drop draft tokens sampled after a stop token on the device
   EXL3_SCHED_MIXED_K: "4"    # vLLM patch: cap drafts scheduled in a mixed prefill + decode step
   EXL3_TAIL_HOLD: "1"        # vLLM patch: keep a finished turn's tail KV briefly for the next tool-call turn
+  EXL3_GPU_EVICT_ORDER: chain   # vLLM patch: a finished request's blocks freed position-interleaved across KV groups
   EXL3_ENCODER_CACHE_TOKENS: "16384"   # vLLM patch: vision encoder cache size
   # Level Zero / compute-runtime completion-wait tuning used in production (NEO 26.31)
   NEOReadDebugKeys: "1"
