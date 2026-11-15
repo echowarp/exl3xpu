@@ -1648,7 +1648,9 @@ def _patch_fast_nan_guard():
             counts = [int(d) + 1 for d in spec_decode_metadata.num_draft_tokens]
         else:
             counts = [1] * len(self.input_batch.req_ids)
-        self._nan_guard_pending = (buf, n, list(self.input_batch.req_ids), counts, self._nan_state_probe)
+        pend = (buf, n, list(self.input_batch.req_ids), counts)
+        probe = getattr(self, "_nan_state_probe", None)   # same tuple as the runner's own guard builds
+        self._nan_guard_pending = pend + (probe,) if probe is not None else pend
         return logits
 
     R._nan_guard = _nan_guard
