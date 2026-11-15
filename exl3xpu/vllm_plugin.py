@@ -682,7 +682,7 @@ def _patch_fast_norm():
 # GDN-RECOMPUTE: speculative decoding for the GDN layers with one
 # committed SSM state slot per request + the previous step's accepted tokens applied lazily (exl3_gdn_recompute),
 # so MambaSpec.num_speculative_blocks = 0. EXL3_GDN_RECOMPUTE=1 enables.
-GDN_RC = {"on": os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1", "S": int(os.environ.get("EXL3_GDN_RC_SLOTS", "16"))}
+GDN_RC = {"on": os.environ.get("EXL3_GDN_RECOMPUTE", "1") == "1", "S": int(os.environ.get("EXL3_GDN_RC_SLOTS", "16"))}
 
 
 def _patch_gdn_recompute():
@@ -708,6 +708,7 @@ def _patch_gdn_recompute():
         from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as qg
     except Exception as e:  # noqa
         logger.warning("exl3: GDN recompute not installed (%s)", e)
+        GDN_RC["on"] = False                          # the runner reads this flag (vLLM gpu_model_runner._gdn_rc_on)
         return
     if getattr(mabs.MambaBase, "_exl3_rc", False):
         return

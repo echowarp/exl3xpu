@@ -10,8 +10,9 @@ Every feature is a separate commit and is switched by an environment variable (p
 `models/qwen3.8-27b-exl3-4.00bpw/model.yaml` is the production configuration: int4_per_token_head KV, MTP k = 7 with
 the dynamic depth schedule, 196,608 context, and the production values of the switches below, except the ones
 that need a data file (`EXL3_KSMOOTH`, `EXL3_DRAFT_VOCAB_FAR`) or belong to the memory layer (`EXL3_LAZY_VISION`,
-keeper, RAM tier). `EXL3_GDN_PORT=1` loads the package's `gdnchunk.so`; GDN recompute stays off (with a warning)
-unless the companion vLLM runner is installed.
+keeper, RAM tier). `EXL3_GDN_PORT=1` loads the package's `gdnchunk.so`. GDN recompute is on by default; the companion vLLM runner
+follows the plugin's switch, and the plugin turns it off (with a warning) when that runner is not installed. The
+companion vLLM branch's own switches default to these production values on an XPU as well.
 Kernel features that are missing from a build, or vLLM internals that are not there, leave the stock path in place
 with a log line.
 
@@ -117,7 +118,7 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_DRAFT_DYN` | 256 | DRAFT-DYN: up to N extra far-head rows per request (its most frequent prompt tokens outside the static head; int4 rows gathered from a host copy of lm_head) |
 | `EXL3_DRAFT_DYN_NEAR` | 128 | the same for the near head |
 | `EXL3_DRAFT_BIAS` | 0 | drafter logit bias on prompt tokens (0 = off) |
-| `EXL3_GDN_RECOMPUTE` | 1 | GDN recompute: MTP spec decoding with one committed SSM state per request (num_speculative_blocks = 0); vLLM patch: gpu_model_runner GDN-RC hooks |
+| `EXL3_GDN_RECOMPUTE` | default (1) | GDN recompute: MTP spec decoding with one committed SSM state per request (num_speculative_blocks = 0); vLLM patch: gpu_model_runner GDN-RC hooks |
 | `EXL3_GDN_RC_SLOTS` | default (16) | pending-pool slots |
 | `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and o/z writes inside the recompute kernel |
 | `EXL3_RC_FUSED_DBG` | default (0) | debug: compare against the unfused kernel |
