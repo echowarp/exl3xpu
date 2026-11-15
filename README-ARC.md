@@ -7,6 +7,11 @@ The base is upstream commit 15ded2f; everything upstream documents in `README.md
 
 Every feature is a separate commit and is switched by an environment variable (pass them with
 `scripts/serve.py ... --set env.NAME=value`; serve.py applies the model.yaml `env:` over the process environment).
+`models/qwen3.8-27b-exl3-4.00bpw/model.yaml` is the production configuration: int4_per_token_head KV, MTP k = 7 with
+the dynamic depth schedule, 196,608 context, and the production values of the switches below, except the ones
+that need a data file (`EXL3_KSMOOTH`, `EXL3_DRAFT_VOCAB_FAR`) or belong to the memory layer (`EXL3_LAZY_VISION`,
+keeper, RAM tier). `EXL3_GDN_PORT=1` loads the package's `gdnchunk.so`; GDN recompute stays off (with a warning)
+unless the companion vLLM runner is installed.
 Kernel features that are missing from a build, or vLLM internals that are not there, leave the stock path in place
 with a log line.
 
@@ -117,7 +122,7 @@ schedule, `max_model_len` 196,608). "default (x)" = not set there, code default 
 | `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and o/z writes inside the recompute kernel |
 | `EXL3_RC_FUSED_DBG` | default (0) | debug: compare against the unfused kernel |
 | `EXL3_GDN_RPS` | 4 | state rows per sub-group in the recompute kernels |
-| `EXL3_GDN_PORT` | path of `gdnchunk.so` | GDN-PORT: non-spec prefill rows on the 16-row chunked GDN prefill (deterministic); vLLM patch: `gdn_attn.py` metadata `pos0` |
+| `EXL3_GDN_PORT` | 1 (= `<package>/gdnchunk.so`; or a path) | GDN-PORT: non-spec prefill rows on the 16-row chunked GDN prefill (deterministic); vLLM patch: `gdn_attn.py` metadata `pos0` |
 | `EXL3_GDN_PORT_TOKINDX` | 1 | mixed steps: the port reads/writes the rows in place (no gather/scatter) |
 | `EXL3_GDN_PORT_TRACE` | default (0) | debug: per-step checksums in the log |
 | `EXL3_DYN_SD_FULL` | 2 | 1: keep FULL decode graphs with a dynamic speculative depth schedule; 2: also capture FULL graphs for every depth of the schedule |

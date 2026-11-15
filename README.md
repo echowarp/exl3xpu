@@ -16,7 +16,11 @@ host kernel 7.1.8 (xe), compute-runtime 26.31.39395.13, IGC 2.40.13, Level Zero 
 
 ## Results: Qwen3.8-27B EXL3 4.00bpw, one B70
 
-Config [`models/qwen3.8-27b-exl3-4.00bpw/model.yaml`](models/qwen3.8-27b-exl3-4.00bpw/model.yaml):
+Note (this fork): `model.yaml` now holds the int4-KV production configuration described in `README-ARC.md`; the
+results below were measured with upstream's fp8-KV configuration, which the comment at the top of its `vllm:`
+block shows how to restore.
+
+Upstream config [`models/qwen3.8-27b-exl3-4.00bpw/model.yaml`](models/qwen3.8-27b-exl3-4.00bpw/model.yaml):
 MTP speculative decoding k=3 (the EXL3 MTP head shipped in the checkpoint, draft lm_head pruned to 512 vocab
 blocks), fp8 KV cache (272,570 tokens in 1600-token blocks), max context 262,144, 16 sequences, image (4/prompt) and
 video (1/prompt) input. Model revision `113cf7ab958054860e43fb7f3063b1af19171095` (branch `4.00bpw`).
@@ -113,8 +117,8 @@ docker run --rm --device /dev/dri -v /dev/dri/by-path:/dev/dri/by-path:ro --shm-
 - `/dev/dri/by-path` must be mounted: oneCCL enumerates devices through it. To pin one card on a multi-GPU
   host, pass only that card's render node (`--device /dev/dri/renderDNNN`) and mount a `by-path` directory that
   holds only that card's link (this is what the Omarchy local-ai plugin does).
-- Serving config (MTP k=3, fp8 KV in 1600-token blocks, 262,144 context, 16 sequences, 4096-token prefill
-  chunks, 32 images / 4 videos per request, images capped at 4.2 MP) is `models/qwen3.8-27b-exl3-4.00bpw/model.yaml`;
+- Serving config (this fork: MTP k=7 with a dynamic depth schedule, int4 KV, 196,608 context, 16 sequences,
+  8192-token prefill chunks, 32 images per request, images capped at 4.2 MP) is `models/qwen3.8-27b-exl3-4.00bpw/model.yaml`;
   `python3 scripts/serve.py models/qwen3.8-27b-exl3-4.00bpw --gpu 0 --print` shows the exact `vllm serve` command.
 - Build it yourself: `docker build -f docker/Dockerfile -t exl3xpu .` (base image pinned by digest), or inside any
   vLLM XPU environment with oneAPI 2025.3: `scripts/build_ext.sh && pip install -e .`.

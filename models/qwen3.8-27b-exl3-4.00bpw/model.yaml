@@ -14,36 +14,86 @@ source:
     quantization_config.json's tensor_storage, detected from the weight index). bf16: norms, in_proj_a/b,
     embeddings, the 27-block vision tower.
 
-# One B70: MTP (the EXL3 repo ships the MTP head quantized to EXL3 4-bit), vision (bf16 tower in the repo),
-# 256K context with fp8 KV. Weights 14.9 GiB + MTP head + vision; KV fp8 256K ~8.4 GiB.
+# One B70 = the production configuration of this fork (README-ARC.md): MTP k = 7 with a dynamic depth schedule, int4
+# per-token-head KV (K nibbles + RHT, asymmetric zero point), 196,608-token context, images. Weights 14.9 GiB + MTP
+# head + vision. The schedule and several env switches below need the companion vLLM 0.26 XPU branch (README-ARC.md
+# "vLLM patch"); with stock vLLM those switches are not read and the plugin features log and keep the stock path.
+# Upstream's fp8-KV configuration: --set vllm.kv_cache_dtype=fp8 --set vllm.max_model_len=262144
+#   --set vllm.speculative_config.num_speculative_tokens=3 --set vllm.speculative_config.num_speculative_tokens_per_batch_size=null
 vllm:
   dtype: float16
-  max_model_len: 262144
-  kv_cache_dtype: fp8
-  gpu_memory_utilization: 0.965
+  max_model_len: 196608
+  kv_cache_dtype: int4_per_token_head
+  attention_backend: TRITON_ATTN   # the plugin's int8 / int4 KV attention patches the Triton backend
+  gpu_memory_utilization: 0.94
   max_num_seqs: 16
-  max_num_batched_tokens: 4096   # prefill chunk: decode waits ~3.7 s behind a long prompt (8192: ~7 s); keeps 128K prefill >= 1000
+  max_num_batched_tokens: 8192   # prefill chunk (4096: decode waits less behind a long prompt, slower long prefill)
   trust_remote_code: true
   enable_prefix_caching: true   # must be explicit: vLLM 0.26 leaves it off for hybrid (GDN) models
   mamba_cache_mode: align
   speculative_config:
     method: qwen3_5_mtp
-    num_speculative_tokens: 3
-  limit_mm_per_prompt: {image: 32, video: 4}
+    num_speculative_tokens: 7
+    # [min requests, max requests, depth]: k = 7 at 1-4 decoding requests down to k = 2 above 8
+    num_speculative_tokens_per_batch_size: [[1, 4, 7], [5, 5, 5], [6, 6, 4], [7, 8, 3], [9, 256, 2]]
+    draft_sample_method: probabilistic
+    attention_backend: TRITON_ATTN
+  limit_mm_per_prompt: {image: 32, video: 0}
   # cap image area at preprocessing (the processor default allows 16.7 MP, whose ~65K ViT patches crash the
   # vision encoder with UR OUT_OF_RESOURCES); larger images are downscaled to <= 4.2 MP (~4K tokens)
   mm_processor_kwargs: {size: {longest_edge: 4194304, shortest_edge: 65536}}
+  structured_outputs_config: {backend: xgrammar, disable_any_whitespace: true}
+  reasoning_parser: qwen3
+  enable_auto_tool_choice: true
+  tool_call_parser: qwen3_coder
   compilation_config:
     cudagraph_mode: FULL_DECODE_ONLY
     cudagraph_capture_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64]
 
+# Engine / kernel switches of the production build (README-ARC.md "Environment variables" has every variable).
+# Not set here: EXL3_KSMOOTH and EXL3_DRAFT_VOCAB_FAR (data files made from your own traffic: README-ARC.md
+# "Data files"; production int4 quality is measured with K smoothing), EXL3_LAZY_VISION (memory policy: AllBroker).
 env:
   VLLM_XPU_ENABLE_XPU_GRAPH: "1"
-  EXL3_DRAFT_VOCAB: "{model_dir}/draft_vocab.json"   # pruned MTP draft head (scripts/draft_vocab.py)
-  EXL3_KV_BLOCK_EXACT: "1"   # keep 1600-token KV blocks (not 2048): C16 thinking 10 -> 14 streams, +17% agg
   VLLM_WORKER_MULTIPROC_METHOD: spawn
-  EXL3_ONEDNN_ATTN: "1"    # oneDNN Graph fused SDPA for long-prefix prefill: 128K 1234 -> 1415, 254K 769 -> 911 tok/s; needle 6/6 at 131K/240K
-  EXL3_INT8_PREFILL: "1"   # W8A8 prefill linears: 32K 1434 -> 1979 tok/s, omp replay TTFT p50 4.65 -> 3.78 s; NLL +0.17%
+  VLLM_KV_CACHE_LAYOUT: NHD
+  VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "12800"   # prefix-cache GDN state checkpoints every 12,800 tokens (not every block)
+  EXL3_DRAFT_VOCAB: "{model_dir}/draft_vocab.json"   # pruned MTP draft head (scripts/draft_vocab.py)
+  EXL3_DRAFT_FAR_FROM: "2"   # draft positions >= 2 use EXL3_DRAFT_VOCAB_FAR when it is set
+  EXL3_DRAFT_Q4: "64"        # draft heads as plain int4 g64 (drafter only)
+  EXL3_DRAFT_DYN: "256"      # DRAFT-DYN: per-request extra far-head rows (frequent prompt tokens)
+  EXL3_DRAFT_DYN_NEAR: "128"
+  EXL3_DRAFT_BIAS: "0"
+  EXL3_DS_SUB: "1"           # draft sampling from the pruned head's compact logits
+  EXL3_KV_BLOCK_EXACT: "1"   # keep the hybrid-negotiated KV block size (no rounding up to 2048)
+  EXL3_ONEDNN_ATTN: "1"      # oneDNN Graph fused SDPA for long-prefix prefill
+  EXL3_I8_ONEDNN_MAXLEN: "60000"   # above this many keys: chunked FA prefill (bounded memory)
+  EXL3_I8_SPLITS: "80,40,64,40"    # decode-attention split count per number of requests
+  EXL3_INT8_PREFILL: "1"     # W8A8 prefill linears: NLL +0.17%
+  EXL3_MAX_MB: "128"         # MB96 / MB128 decode GEMM tiles (needs the build_arc.sh _C.so)
+  EXL3_SHAPE_P_FILE: "{model_dir}/shape_p_c.json"   # per-shape split-K table measured on a B70
+  EXL3_DET_LINEAR: "1"       # unquantized fp16 linears through deterministic oneDNN primitives
+  EXL3_GDN_RECOMPUTE: "1"    # vLLM patch: one committed SSM state per request with MTP
+  EXL3_RC_FUSED_IN: "1"
+  EXL3_RC_PINNED: "1"        # vLLM patch: recompute bookkeeping copies through pinned buffers (async)
+  EXL3_GDN_PORT: "1"         # GDN prefill on gdnchunk.so (<package>/gdnchunk.so); vLLM patch: gdn_attn.py pos0
+  EXL3_GDN_PORT_TOKINDX: "1"
+  EXL3_DYN_SD_FULL: "2"      # FULL decode graphs for every depth of the schedule
+  EXL3_UNIFORM_SPEC: "1"
+  EXL3_FAST_NAN_GUARD: "1"   # vLLM patch: fused NaN guard (ng.so)
+  EXL3_ALIGN_NOSYNC: "1"     # vLLM patch: align-mode mamba bookkeeping without host syncs
+  EXL3_EAGLE_KEEP: "2"       # vLLM patch: keep the full prefix-cache hit despite the MTP last-block rule
+  EXL3_SPEC_STOP_TRUNC: "1"  # vLLM patch: drop draft tokens sampled after a stop token on the device
+  EXL3_SCHED_MIXED_K: "4"    # vLLM patch: cap drafts scheduled in a mixed prefill + decode step
+  EXL3_TAIL_HOLD: "1"        # vLLM patch: keep a finished turn's tail KV briefly for the next tool-call turn
+  EXL3_ENCODER_CACHE_TOKENS: "16384"   # vLLM patch: vision encoder cache size
+  # Level Zero / compute-runtime completion-wait tuning used in production (NEO 26.31)
+  NEOReadDebugKeys: "1"
+  EnableUserFenceForCompletionWait: "1"
+  EventHostSynchronizeLinuxUserFenceKmdWait: "1"
+  OverrideEnableKmdNotify: "1"
+  OverrideKmdNotifyDelayMicroseconds: "200"
+  OverrideUseKmdWaitFunction: "1"
 
 # Data parallel: one replica per GPU behind scripts/lb.py (the model fits one 32 GB B70).
 parallel:

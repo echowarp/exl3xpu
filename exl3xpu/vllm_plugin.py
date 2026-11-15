@@ -688,6 +688,17 @@ GDN_RC = {"on": os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1", "S": int(os.en
 def _patch_gdn_recompute():
     if not GDN_RC["on"]:
         return
+    try:                                              # needs the companion vLLM runner (GDN-RC bookkeeping)
+        import importlib.util
+        _o = importlib.util.find_spec("vllm.v1.worker.gpu_model_runner").origin
+        with open(_o) as _f:
+            _patched = "_llmt_gdn_rc" in _f.read()
+    except Exception:  # noqa
+        _patched = False
+    if not _patched:
+        logger.warning("exl3: GDN recompute needs the companion vLLM gpu_model_runner (_llmt_gdn_rc); not installed")
+        GDN_RC["on"] = False
+        return
     import dataclasses
     try:
         from vllm.model_executor.layers.mamba import abstract as mabs
@@ -750,12 +761,17 @@ def _rc_alloc(layer, dev):
                         torch.zeros(2, S, T1, HV, device=dev), torch.zeros(2, S, T1, HV, device=dev))
 
 
-# GDN-PORT (off unless EXL3_GDN_PORT=<gdnchunk .so>): the non-spec prefill rows of a step go to the
+# GDN-PORT (off unless EXL3_GDN_PORT=<gdnchunk .so> or 1 = <package>/gdnchunk.so): the non-spec prefill rows of a step go to the
 # 16-row chunked GDN prefill port (gdnchunk/: deterministic, more accurate than _xpu_C.gdn_attention)
 # instead of _xpu_C.gdn_attention. In place (src == dst = the request's state slot), one exact checkpoint per request at
 # pos0 + len (vLLM's state semantics), no tail pool. Needs the gdnport gdn_attn.py (metadata field pos0). Falls back to
 # the production op for anything else (non-spec decode rows in no-spec steps, interleaved layout, missing pos0).
-_PORT = {"so": os.environ.get("EXL3_GDN_PORT", ""), "ok": None, "n": 0, "dt": {}}
+_PORT_SO = os.environ.get("EXL3_GDN_PORT", "")
+if _PORT_SO == "1":                                    # 1 = the gdnchunk.so built into the package (scripts/build_arc.sh)
+    _PORT_SO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gdnchunk.so")
+elif _PORT_SO == "0":
+    _PORT_SO = ""
+_PORT = {"so": _PORT_SO, "ok": None, "n": 0, "dt": {}}
 _PORT_TRACE = os.environ.get("EXL3_GDN_PORT_TRACE", "0") == "1"
 _PORT_TOKINDX = os.environ.get("EXL3_GDN_PORT_TOKINDX", "0") == "1"   # mixed steps: in-place rows via token_indx
 

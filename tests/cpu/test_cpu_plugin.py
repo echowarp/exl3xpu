@@ -1,6 +1,7 @@
 """CPU-only checks of the exl3xpu plugin pieces that need no Arc GPU: the no-mmap loader reads safetensors exactly,
 the plugin prefers AllBroker's llmt_kv copy of that loader, the vLLM entry point is declared, the LoRA-kernel hook
-module degrades to None without its ops, and env-switched features default off.
+module degrades to None without its ops, env-switched features default off, and the model.yaml serving config is the
+production (int4 KV) build.
 
     python -m pytest -q tests/cpu/test_cpu_plugin.py      (from the repository root)
 """
@@ -119,6 +120,36 @@ def test_lazyvis_default_off():
         if old is not None:
             os.environ["EXL3_LAZY_VISION"] = old
     assert lv.ON is False
+
+
+def test_model_yaml_is_production_int4():
+    """models/<id>/model.yaml = the production build: int4 KV, k = 7 with a depth schedule, the switches as strings, and
+    serve.py turns it into a vllm serve command (no GPU needed for --print)."""
+    import subprocess
+    try:
+        import yaml
+    except ImportError:
+        pytest.skip("pyyaml not installed")
+    mdir = os.path.join(ROOT, "models", "qwen3.8-27b-exl3-4.00bpw")
+    cfg = yaml.safe_load(open(os.path.join(mdir, "model.yaml")))
+    v, env = cfg["vllm"], cfg["env"]
+    assert v["kv_cache_dtype"] == "int4_per_token_head" and v["attention_backend"] == "TRITON_ATTN"
+    assert v["speculative_config"]["num_speculative_tokens"] == 7
+    assert all(isinstance(x, str) for x in env.values())
+    for k in ("EXL3_GDN_RECOMPUTE", "EXL3_GDN_PORT", "EXL3_DRAFT_DYN", "EXL3_INT8_PREFILL", "EXL3_SHAPE_P_FILE"):
+        assert k in env, k
+    assert "EXL3_KSMOOTH" not in env and "EXL3_LAZY_VISION" not in env and "EXL3_WHX" not in env
+    assert os.path.exists(os.path.join(mdir, "shape_p_c.json"))
+    out = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "serve.py"), mdir, "--gpu", "0", "--print"],
+                         capture_output=True, text=True, check=True).stdout
+    assert "--kv-cache-dtype int4_per_token_head" in out and "num_speculative_tokens_per_batch_size" in out
+
+
+def test_gdn_port_1_means_package_lib():
+    src = open(os.path.join(ROOT, "exl3xpu", "vllm_plugin.py")).read()
+    assert 'if _PORT_SO == "1":' in src and '"gdnchunk.so")' in src
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as f:
+        assert "gdnchunk.so" in tomllib.load(f)["tool"]["setuptools"]["package-data"]["exl3xpu"]
 
 
 if __name__ == "__main__":
