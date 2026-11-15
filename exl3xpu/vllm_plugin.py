@@ -1634,7 +1634,7 @@ def _patch_fast_nan_guard():
 
     def _nan_guard(self, logits, spec_decode_metadata=None):
         if (logits is None or not hasattr(self, "_nan_guard_eos") or not getattr(self, "_nan_guard_on", True)
-                or self._nan_guard_inject or logits.dim() != 2 or logits.stride(-1) != 1
+                or getattr(self, "_nan_guard_inject", 0) or logits.dim() != 2 or logits.stride(-1) != 1
                 or logits.device.type != "xpu" or logits.dtype not in (torch.float16, torch.float32)):
             return orig(self, logits, spec_decode_metadata)
         flags = E.nan_guard_rows(logits, self._nan_guard_eos)
