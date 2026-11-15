@@ -52,7 +52,7 @@ memory. That is the memory layer, [AllBroker](https://github.com/echowarp/AllBro
 | Weight keeper (weights stay resident across engine restarts, Level Zero IPC) | AllBroker `llmt-keeper` + engine-side `whx_loader` (XPU backend) | nothing; the XPU keeper works on the model's parameters |
 | No-mmap safetensors loader | AllBroker `llmt_kv.nommap_loader` | `exl3xpu/nommap_loader.py`, the same code; the plugin uses `llmt_kv`'s copy when it is installed and falls back to the bundled one |
 | KV lending, LoRA / vision / prefill scratch, RAM KV tier | AllBroker (`llmt_kv`, vLLM plugin + connector) | the LoRA kernels (`lorak/`, `csrc/lora_esimd.h`), which the lend manager calls through `EXL3_LORA_KERNELS=llmt_lora_kernels` |
-| Lazy vision tower | AllBroker's broker-managed version (VRAM budget shared with KV lending) | `exl3xpu/lazyvis.py`: the standalone device-only version production runs today (`EXL3_LAZY_VISION`). Kept for compatibility; with AllBroker installed, use its module instead (do not enable both) |
+| Lazy vision tower | AllBroker's broker-managed version (VRAM budget shared with KV lending) | `exl3xpu/lazyvis.py`: the standalone device-only version production runs today (`EXL3_LAZY_VISION`). Kept for compatibility; with AllBroker installed, its module takes over (the standalone copy then stays off by itself) |
 
 GPU-specific settings are configuration, not code: every feature is an `EXL3_*` (LoRA kernels: `LLMT_LK_*`) variable
 listed below with its production value, and the per-shape split-K table is a data file (`EXL3_SHAPE_P_FILE`).

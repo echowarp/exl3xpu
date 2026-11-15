@@ -12,6 +12,7 @@ import os
 import struct
 import sys
 import tomllib
+import types
 
 import torch
 
@@ -150,6 +151,33 @@ def test_gdn_port_1_means_package_lib():
     assert 'if _PORT_SO == "1":' in src and '"gdnchunk.so")' in src
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as f:
         assert "gdnchunk.so" in tomllib.load(f)["tool"]["setuptools"]["package-data"]["exl3xpu"]
+
+
+def test_lazyvis_defers_to_allbroker():
+    """With AllBroker's llmt_kv plugin installed, the standalone lazy tower does not install a second time."""
+    import importlib.metadata as md
+    old_env, old_ep = os.environ.get("EXL3_LAZY_VISION"), md.entry_points
+    os.environ["EXL3_LAZY_VISION"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("lazyvis_defer_t", os.path.join(ROOT, "exl3xpu", "lazyvis.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        md.entry_points = lambda group=None: [types.SimpleNamespace(value="llmt_kv.plugin:register")]
+        assert m._allbroker_lazyvis() is True
+        m.install()                                   # returns before touching vLLM's loader
+        assert m._STATE["installed"] is True and not m._STATE.get("towers")
+        os.environ["LLMT_KV_PLUGIN"] = "0"
+        assert m._allbroker_lazyvis() is False
+        md.entry_points = lambda group=None: []
+        os.environ.pop("LLMT_KV_PLUGIN")
+        assert m._allbroker_lazyvis() is False
+    finally:
+        md.entry_points = old_ep
+        os.environ.pop("LLMT_KV_PLUGIN", None)
+        if old_env is None:
+            os.environ.pop("EXL3_LAZY_VISION", None)
+        else:
+            os.environ["EXL3_LAZY_VISION"] = old_env
 
 
 if __name__ == "__main__":
