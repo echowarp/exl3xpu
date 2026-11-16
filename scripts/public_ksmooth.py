@@ -21,8 +21,9 @@ Inputs = the groups and shares of exl3xpu scripts/public_draft_vocab.py (GSM8K /
   (--out is only recorded in the inputs file; the engine writes the table to its EXL3_KSMOOTH_CALIB path)
 
 Measured (Arc B70, Qwen3.8-27B EXL3 4.0 bpw, int4 KV, 126,099 held-out GSM8K tokens teacher-forced, vs a table built
-the same way on production agent traffic): NLL +0.037 %, top-5 KL 4.2e-3, top-1 agreement 98.27 %, single-stream decode
-192 vs 193 tok/s. Without any table: NLL +0.43 % and 142 tok/s (the fused int4 KV write needs a table)."""
+the same way on production agent traffic): NLL +0.037 %, top-5 KL 4.2e-3, top-1 agreement 98.27 %; without any table
+NLL +0.43 %. Speed: the table enables the fused int4 KV write, about +6-7 % on a fast host and up to +35 % per-stream
+decode on a slow, host-bound CPU."""
 import argparse, glob, hashlib, json, os, random, sys, sysconfig, uuid, urllib.request
 
 ap = argparse.ArgumentParser()

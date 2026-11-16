@@ -23,7 +23,7 @@ Branch `publish-20261113` on upstream 15ded2f. Features and switches: `README-AR
 - This branch's plugin with the published vLLM XPU branch and AllBroker (overlay on the production image): hooks
   native, KV 497,302 tokens, LoRA decode 179.9 tok/s (1 stream) / 161.2 (2 streams), 6 x 60k stress 0 OOM.
 - Public K-smoothing table vs production's traffic-built one (int4 KV, 126,099 held-out GSM8K tokens): NLL +0.037 %,
-  top-5 KL 4.2e-3, single-stream decode 192 vs 193 tok/s; no table: NLL +0.43 %, 142 tok/s.
+  top-5 KL 4.2e-3; no table: NLL +0.43 %. Speed: the table plus the fused int4 KV write it enables add about +6-7 % on a fast host (Arc B70: 1-stream aggregate 111.8 -> 119.7 tok/s, per-stream decode 139.2 -> 148.5) and up to +35 % per-stream decode on a slow, host-bound CPU (142 -> 192 tok/s on HumanEval prompts).
 - Public draft vocabularies, coverage of held-out Qwen3.8-27B outputs: 512 / 128 blocks cover 99.3 / 94.8 % (GSM8K
   greedy) and 96.5 / 81.6 % (IFBench), the same token share as vocabularies ranked on production traffic.
 

@@ -173,8 +173,7 @@ in `public_r.pt.inputs.json`). How to make your own:
   rewritten after every batch. Then serve with `EXL3_KSMOOTH=ksmooth.pt` (and without `EXL3_KSMOOTH_CALIB`).
   `scripts/public_ksmooth.py` feeds such an engine the public input set of `public_draft_vocab.py` (the shipped
   `public_r.pt`). Measured on the Arc (int4 KV, 126,099 held-out GSM8K tokens, vs a table built on production agent
-  traffic): NLL +0.037 %, top-5 KL 4.2e-3, single-stream decode 192 vs 193 tok/s; without a table NLL +0.43 % and
-  142 tok/s (the fused int4 KV write needs a table).
+  traffic): NLL +0.037 %, top-5 KL 4.2e-3; without a table NLL +0.43 %. Speed: the table plus the fused int4 KV write it enables add about +6-7 % on a fast host (Arc B70: 1-stream aggregate 111.8 -> 119.7 tok/s, per-stream decode 139.2 -> 148.5) and up to +35 % per-stream decode on a slow, host-bound CPU (142 -> 192 tok/s on HumanEval prompts).
 - **Split-K table** (`EXL3_SHAPE_P_FILE`): `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` is a kernel timing
   measurement on a B70 for the model's matrix shapes (no traffic data); other GPUs or models need their own
   timings (`{"N,K,MB": P}` or `{"N,K,MB": [NT, P]}`).
@@ -183,8 +182,8 @@ in `public_r.pt.inputs.json`). How to make your own:
 
 - **Out of the box** the public draft vocabularies (`public-512.json`, `public-128.json`) and the public K-smoothing table
   (`public_r.pt`) in `models/qwen3.8-27b-exl3-4.00bpw/` are the model.yaml defaults. Measured against the tables production builds from its own agent traffic: the public K-smoothing
-  table gives NLL +0.037 %, top-5 KL 4.2e-3 and single-stream decode 192 vs 193 tok/s (Arc B70, int4 KV, 126,099
-  held-out GSM8K tokens; no table: NLL +0.43 %, 142 tok/s); the public vocabularies cover the same share of held-out
+  table gives NLL +0.037 % and top-5 KL 4.2e-3 (Arc B70, int4 KV, 126,099 held-out GSM8K tokens; no table: NLL +0.43 %)
+  at the production table's speed (versus no table: the table plus the fused int4 KV write it enables add about +6-7 % on a fast host (Arc B70: 1-stream aggregate 111.8 -> 119.7 tok/s, per-stream decode 139.2 -> 148.5) and up to +35 % per-stream decode on a slow, host-bound CPU (142 -> 192 tok/s on HumanEval prompts)); the public vocabularies cover the same share of held-out
   model outputs (512 / 128 blocks: 99.3 / 94.8 % on GSM8K, 96.5 / 81.6 % on IFBench). Decode speed with the public
   vocabularies has not been measured yet.
 - **Draft vocabulary from your traffic:** rank on text like your model's outputs with exl3xpu
