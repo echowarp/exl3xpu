@@ -179,6 +179,28 @@ in `public_r.pt.inputs.json`). How to make your own:
   measurement on a B70 for the model's matrix shapes (no traffic data); other GPUs or models need their own
   timings (`{"N,K,MB": P}` or `{"N,K,MB": [NT, P]}`).
 
+### Tuning for your own traffic
+
+- **Out of the box** the public draft vocabularies (`public-512.json`, `public-128.json`) and the public K-smoothing table
+  (`public_r.pt`) in `models/qwen3.8-27b-exl3-4.00bpw/` are the model.yaml defaults. Measured against the tables production builds from its own agent traffic: the public K-smoothing
+  table gives NLL +0.037 %, top-5 KL 4.2e-3 and single-stream decode 192 vs 193 tok/s (Arc B70, int4 KV, 126,099
+  held-out GSM8K tokens; no table: NLL +0.43 %, 142 tok/s); the public vocabularies cover the same share of held-out
+  model outputs (512 / 128 blocks: 99.3 / 94.8 % on GSM8K, 96.5 / 81.6 % on IFBench). Decode speed with the public
+  vocabularies has not been measured yet.
+- **Draft vocabulary from your traffic:** rank on text like your model's outputs with exl3xpu
+  `scripts/draft_vocab.py --model <checkpoint> --blocks 512 --text '<your outputs>/*.txt' --out draft-512.json` (and
+  `--blocks 128` for the far head). `scripts/public_draft_vocab.py` is the same ranking over its fixed public input set.
+  Drafts only: the output distribution does not change, only how many draft tokens are accepted.
+- **K-smoothing table from your traffic:** run ONE engine eager (`enforce_eager`) with `EXL3_KSMOOTH_CALIB=/path/ksmooth.pt`
+  and without `EXL3_KSMOOTH`, on the KV dtype you serve with, over representative traffic or a replay of it. The table is
+  rewritten as it goes (exl3xpu: every `EXL3_KSMOOTH_CALIB_EVERY` batches, default 1; exl3cuda: every 64 calls). Then
+  restart serving with `EXL3_KSMOOTH=/path/ksmooth.pt` (and without `EXL3_KSMOOTH_CALIB`). exl3xpu
+  `scripts/public_ksmooth.py` is this procedure fed with public text. The file format is the same on both GPUs.
+- **Caveats:** calibration needs an eager engine (no graphs, so it is slower while it runs): use a separate engine or a
+  quiet period. A new table invalidates cached KV and the RAM-tier entries (the table's checksum is part of the tier's
+  compatibility tag), so switch at a planned restart; engines that share a RAM tier must all use the same table. This
+  is how production does it.
+
 ## Layout added by this fork
 
 | Path | What |
