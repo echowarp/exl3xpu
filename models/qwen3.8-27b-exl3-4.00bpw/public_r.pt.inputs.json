@@ -1,0 +1,72 @@
+{
+ "out": "public_r.pt",
+ "tokens_per_group": {
+  "code": 124509,
+  "docs": 100071,
+  "tool": 68429,
+  "chat": 42654,
+  "prose": 43735
+ },
+ "shares": {
+  "code": 0.3,
+  "docs": 0.25,
+  "tool": 0.25,
+  "chat": 0.1,
+  "prose": 0.1
+ },
+ "inputs": [
+  {
+   "group": "chat",
+   "file": "mt_bench_question.jsonl",
+   "sha256": "119565adbab82227089cefdb44c8d7e2cf04dc0a0ec233634c82e7d4e2a944f7",
+   "note": "MT-Bench (Apache-2.0)"
+  },
+  {
+   "group": "chat",
+   "file": "HumanEval.jsonl",
+   "sha256": "1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2",
+   "note": "HumanEval (MIT)"
+  },
+  {
+   "group": "prose",
+   "file": "pg1342.txt",
+   "sha256": "3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75",
+   "note": "Project Gutenberg, public domain"
+  },
+  {
+   "group": "prose",
+   "file": "pg2600.txt",
+   "sha256": "2d5bb2ad5f422765e714617e21fa31bbaf8958aa79682c86fca6660fcc5d1b2b",
+   "note": "Project Gutenberg, public domain"
+  },
+  {
+   "group": "prose",
+   "file": "pg2701.txt",
+   "sha256": "b5e88b71a1cda068e9ab1d94344c9d932338ba6da1a66def97a1aecd9cfcc87d",
+   "note": "Project Gutenberg, public domain"
+  },
+  {
+   "group": "tool",
+   "file": "json_mode_eval.jsonl",
+   "sha256": "24dd61cdf8f10978dbbb7c4e862ebb99ba2e65799517c4e66ed938e50669afe8",
+   "note": "NousResearch/json-mode-eval (Apache-2.0) + server chat-template tool-call renders (token ids)"
+  },
+  {
+   "group": "code",
+   "file": "/usr/lib/python3.14/*.py",
+   "files": 157,
+   "sha256": "e7f912e19ca3099526fcfbbb08ebdb2bb989a710018ccd31c2ca3c256722b4de",
+   "note": "host Python stdlib (PSF)"
+  },
+  {
+   "group": "docs",
+   "file": "/usr/lib/python3/dist-packages/*.dist-info/METADATA",
+   "files": 64,
+   "sha256": "f16a80c6591d9ea9b2ba4d0e5586a83c312630038e9c5a9b9bac0310080672a7",
+   "note": "host packages' PyPI long descriptions"
+  }
+ ],
+ "model": "qwen3.8-27b",
+ "method": "exl3xpu EXL3_KSMOOTH_CALIB, robust (EXL3_KSMOOTH_ROBUST=1), eager engine, prefill only",
+ "sha256": "9c7765bc8707254624f805993744264541e4c6b5ff09bfef5901860f206e646d"
+}

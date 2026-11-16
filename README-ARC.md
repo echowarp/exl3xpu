@@ -9,7 +9,7 @@ Every feature is a separate commit and is switched by an environment variable (p
 `scripts/serve.py ... --set env.NAME=value`; serve.py applies the model.yaml `env:` over the process environment).
 `models/qwen3.8-27b-exl3-4.00bpw/model.yaml` is the production configuration: int4_per_token_head KV, MTP k = 7 with
 the dynamic depth schedule, 196,608 context, and the production values of the switches below, except the ones
-that need a data file made from your own prompts (`EXL3_KSMOOTH`) or belong to the memory layer (`EXL3_LAZY_VISION`,
+that belong to the memory layer (`EXL3_LAZY_VISION`,
 keeper, RAM tier). `EXL3_GDN_PORT=1` loads the package's `gdnchunk.so`. GDN recompute is on by default; the companion vLLM runner
 follows the plugin's switch, and the plugin turns it off (with a warning) when that runner is not installed and,
 unless `EXL3_GDN_RECOMPUTE=1` is set, for models that are not EXL3. The companion vLLM branch's own switches default
@@ -148,9 +148,10 @@ Other production settings outside this package: vLLM `gpu_memory_utilization` 0.
 
 ## Data files you supply
 
-Nothing derived from traffic ships with this fork. The draft vocabularies default to a public pair shipped in the model
-directory (`public-512.json`, `public-128.json`, built by `scripts/public_draft_vocab.py` below); production used a pair
-ranked on its own traffic. The other production data files are ones you make yourself:
+Nothing derived from traffic ships with this fork. The data files default to public builds shipped in the model
+directory: the draft vocabularies `public-512.json` / `public-128.json` (`scripts/public_draft_vocab.py`; production used
+a pair ranked on its own traffic) and the K-smoothing table `public_r.pt` (`scripts/public_ksmooth.py`, inputs and sha256
+in `public_r.pt.inputs.json`). How to make your own:
 
 - **Draft vocabularies** (`EXL3_DRAFT_VOCAB`, `EXL3_DRAFT_VOCAB_FAR`): upstream's generator ranks 128-token vocab
   blocks by token frequency on a text corpus. Rank on text that looks like your traffic:
@@ -170,6 +171,10 @@ ranked on its own traffic. The other production data files are ones you make you
 - **K-smoothing table** (`EXL3_KSMOOTH`): run the engine eager (`enforce_eager`) with `EXL3_KSMOOTH_CALIB=ksmooth.pt`
   and the int8 or int4 KV cache over representative prompts; the table (a `{layer: mean[H, D]}` torch file) is
   rewritten after every batch. Then serve with `EXL3_KSMOOTH=ksmooth.pt` (and without `EXL3_KSMOOTH_CALIB`).
+  `scripts/public_ksmooth.py` feeds such an engine the public input set of `public_draft_vocab.py` (the shipped
+  `public_r.pt`). Measured on the Arc (int4 KV, 126,099 held-out GSM8K tokens, vs a table built on production agent
+  traffic): NLL +0.037 %, top-5 KL 4.2e-3, single-stream decode 192 vs 193 tok/s; without a table NLL +0.43 % and
+  142 tok/s (the fused int4 KV write needs a table).
 - **Split-K table** (`EXL3_SHAPE_P_FILE`): `models/qwen3.8-27b-exl3-4.00bpw/shape_p_c.json` is a kernel timing
   measurement on a B70 for the model's matrix shapes (no traffic data); other GPUs or models need their own
   timings (`{"N,K,MB": P}` or `{"N,K,MB": [NT, P]}`).

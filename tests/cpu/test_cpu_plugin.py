@@ -139,7 +139,9 @@ def test_model_yaml_is_production_int4():
     assert all(isinstance(x, str) for x in env.values())
     for k in ("EXL3_GDN_RECOMPUTE", "EXL3_GDN_PORT", "EXL3_DRAFT_DYN", "EXL3_INT8_PREFILL", "EXL3_SHAPE_P_FILE"):
         assert k in env, k
-    assert "EXL3_KSMOOTH" not in env and "EXL3_LAZY_VISION" not in env and "EXL3_WHX" not in env
+    assert "EXL3_LAZY_VISION" not in env and "EXL3_WHX" not in env
+    ks = env["EXL3_KSMOOTH"].replace("{model_dir}", mdir)                    # the shipped public K-smoothing table
+    assert json.load(open(ks + ".inputs.json"))["sha256"] == __import__("hashlib").sha256(open(ks, "rb").read()).hexdigest()
     assert os.path.exists(os.path.join(mdir, "shape_p_c.json"))
     for k, n in (("EXL3_DRAFT_VOCAB", 512), ("EXL3_DRAFT_VOCAB_FAR", 128)):   # the shipped public draft vocabularies
         dv = json.load(open(env[k].replace("{model_dir}", mdir)))
