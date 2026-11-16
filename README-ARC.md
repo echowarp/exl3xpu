@@ -156,7 +156,15 @@ Nothing derived from traffic ships with this fork. The production values above p
       python3 scripts/draft_vocab.py --model <checkpoint> --blocks 512 --text '<your corpus>/*.txt' --out draft-512.json
       python3 scripts/draft_vocab.py --model <checkpoint> --blocks 128 --text '<your corpus>/*.txt' --out draft-128.json
 
-  `models/qwen3.8-27b-exl3-4.00bpw/draft_vocab.json` (upstream, 256 blocks) works as a generic near head.
+  `models/qwen3.8-27b-exl3-4.00bpw/draft_vocab.json` (upstream, 512 blocks) works as a generic near head.
+  Without traffic of your own, `scripts/public_draft_vocab.py` builds a near + far pair (512 + 128 blocks) from a fixed
+  public input set (Python stdlib, PyPI package docs, json-mode-eval + chat-template tool calls, MT-Bench, HumanEval,
+  Gutenberg) and records every input's sha256 in the json. On held-out Qwen3.8-27B outputs (GSM8K greedy, IFBench) its
+  512 / 128-block files cover the same token share as vocabularies ranked on production traffic (99.3 / 94.8 % and
+  96.5 / 81.6 %):
+
+      python3 scripts/public_draft_vocab.py --model <checkpoint> --data <dir with the public files> --blocks 512 128 \
+          --out draft-{n}.json
 - **K-smoothing table** (`EXL3_KSMOOTH`): run the engine eager (`enforce_eager`) with `EXL3_KSMOOTH_CALIB=ksmooth.pt`
   and the int8 or int4 KV cache over representative prompts; the table (a `{layer: mean[H, D]}` torch file) is
   rewritten after every batch. Then serve with `EXL3_KSMOOTH=ksmooth.pt` (and without `EXL3_KSMOOTH_CALIB`).
