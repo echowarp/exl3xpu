@@ -51,15 +51,18 @@ vllm:
     cudagraph_capture_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64]
 
 # Engine / kernel switches of the production build (README-ARC.md "Environment variables" has every variable).
-# Not set here: EXL3_KSMOOTH and EXL3_DRAFT_VOCAB_FAR (data files made from your own traffic: README-ARC.md
-# "Data files"; production int4 quality is measured with K smoothing), EXL3_LAZY_VISION (memory policy: AllBroker).
+# Not set here: EXL3_KSMOOTH (a data file made from your own prompts: README-ARC.md "Data files"; production int4
+# quality is measured with K smoothing), EXL3_LAZY_VISION (memory policy: AllBroker). The draft vocabularies are the
+# public pair in this directory (scripts/public_draft_vocab.py, public text only; production used a pair ranked on
+# its own traffic); draft_vocab.json is upstream's generic 512-block file.
 env:
   VLLM_XPU_ENABLE_XPU_GRAPH: "1"
   VLLM_WORKER_MULTIPROC_METHOD: spawn
   VLLM_KV_CACHE_LAYOUT: NHD
   VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "12800"   # prefix-cache GDN state checkpoints every 12,800 tokens (not every block)
-  EXL3_DRAFT_VOCAB: "{model_dir}/draft_vocab.json"   # pruned MTP draft head (scripts/draft_vocab.py)
-  EXL3_DRAFT_FAR_FROM: "2"   # draft positions >= 2 use EXL3_DRAFT_VOCAB_FAR when it is set
+  EXL3_DRAFT_VOCAB: "{model_dir}/public-512.json"       # pruned MTP draft head, near positions (512 blocks)
+  EXL3_DRAFT_VOCAB_FAR: "{model_dir}/public-128.json"   # draft positions >= EXL3_DRAFT_FAR_FROM (128 blocks)
+  EXL3_DRAFT_FAR_FROM: "2"
   EXL3_DRAFT_Q4: "64"        # draft heads as plain int4 g64 (drafter only)
   EXL3_DRAFT_DYN: "256"      # DRAFT-DYN: per-request extra far-head rows (frequent prompt tokens)
   EXL3_DRAFT_DYN_NEAR: "128"

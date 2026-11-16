@@ -141,6 +141,9 @@ def test_model_yaml_is_production_int4():
         assert k in env, k
     assert "EXL3_KSMOOTH" not in env and "EXL3_LAZY_VISION" not in env and "EXL3_WHX" not in env
     assert os.path.exists(os.path.join(mdir, "shape_p_c.json"))
+    for k, n in (("EXL3_DRAFT_VOCAB", 512), ("EXL3_DRAFT_VOCAB_FAR", 128)):   # the shipped public draft vocabularies
+        dv = json.load(open(env[k].replace("{model_dir}", mdir)))
+        assert dv["source"] == "public" and dv["n_blocks"] == n == len(dv["blocks"]), k
     out = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "serve.py"), mdir, "--gpu", "0", "--print"],
                          capture_output=True, text=True, check=True).stdout
     assert "--kv-cache-dtype int4_per_token_head" in out and "num_speculative_tokens_per_batch_size" in out

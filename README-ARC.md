@@ -9,7 +9,7 @@ Every feature is a separate commit and is switched by an environment variable (p
 `scripts/serve.py ... --set env.NAME=value`; serve.py applies the model.yaml `env:` over the process environment).
 `models/qwen3.8-27b-exl3-4.00bpw/model.yaml` is the production configuration: int4_per_token_head KV, MTP k = 7 with
 the dynamic depth schedule, 196,608 context, and the production values of the switches below, except the ones
-that need a data file (`EXL3_KSMOOTH`, `EXL3_DRAFT_VOCAB_FAR`) or belong to the memory layer (`EXL3_LAZY_VISION`,
+that need a data file made from your own prompts (`EXL3_KSMOOTH`) or belong to the memory layer (`EXL3_LAZY_VISION`,
 keeper, RAM tier). `EXL3_GDN_PORT=1` loads the package's `gdnchunk.so`. GDN recompute is on by default; the companion vLLM runner
 follows the plugin's switch, and the plugin turns it off (with a warning) when that runner is not installed and,
 unless `EXL3_GDN_RECOMPUTE=1` is set, for models that are not EXL3. The companion vLLM branch's own switches default
@@ -148,7 +148,9 @@ Other production settings outside this package: vLLM `gpu_memory_utilization` 0.
 
 ## Data files you supply
 
-Nothing derived from traffic ships with this fork. The production values above point at files you make yourself:
+Nothing derived from traffic ships with this fork. The draft vocabularies default to a public pair shipped in the model
+directory (`public-512.json`, `public-128.json`, built by `scripts/public_draft_vocab.py` below); production used a pair
+ranked on its own traffic. The other production data files are ones you make yourself:
 
 - **Draft vocabularies** (`EXL3_DRAFT_VOCAB`, `EXL3_DRAFT_VOCAB_FAR`): upstream's generator ranks 128-token vocab
   blocks by token frequency on a text corpus. Rank on text that looks like your traffic:
@@ -157,7 +159,7 @@ Nothing derived from traffic ships with this fork. The production values above p
       python3 scripts/draft_vocab.py --model <checkpoint> --blocks 128 --text '<your corpus>/*.txt' --out draft-128.json
 
   `models/qwen3.8-27b-exl3-4.00bpw/draft_vocab.json` (upstream, 512 blocks) works as a generic near head.
-  Without traffic of your own, `scripts/public_draft_vocab.py` builds a near + far pair (512 + 128 blocks) from a fixed
+  Without traffic of your own, `scripts/public_draft_vocab.py` builds the shipped near + far pair (512 + 128 blocks) from a fixed
   public input set (Python stdlib, PyPI package docs, json-mode-eval + chat-template tool calls, MT-Bench, HumanEval,
   Gutenberg) and records every input's sha256 in the json. On held-out Qwen3.8-27B outputs (GSM8K greedy, IFBench) its
   512 / 128-block files cover the same token share as vocabularies ranked on production traffic (99.3 / 94.8 % and
