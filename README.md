@@ -1,7 +1,50 @@
-# exl3xpu
+# echowarp/exl3xpu `publish-20261113`: the Arc Pro B70 production fork
 
-> **Arc Pro B70 production fork:** this branch adds the kernels and plugin features of a Qwen3.8-27B
-> production deployment; see [README-ARC.md](README-ARC.md).
+This fork extends [exl3xpu](https://github.com/sybil-solutions/exl3xpu) (EXL3 weights in vLLM on Intel Arc, by 0xSero)
+with the kernels and plugin features used to serve Qwen3.8-27B (EXL3 4.0 bpw, int4 KV cache, MTP k = 7, contexts up to
+196k tokens, several agents at once) on one Intel Arc Pro B70. Every feature is a separate commit with its own
+`EXL3_*` switch. Fork documentation: [README-ARC.md](README-ARC.md) (every switch with its production value, building,
+data files); release notes: [RELEASE-ARC.md](RELEASE-ARC.md).
+
+## What this fork adds
+
+| Feature | What it does | Measured effect |
+|---|---|---|
+| int4 KV attention | decode, verify and drafter attention on int4 per-token-head KV, fused int4 KV write, q rotation inside the kernels | KV cache 500,193 tokens vs 277,333 with int8 KV and 146,400 with 16-bit KV; KL vs BF16 0.0080 vs 0.0060 (int8 KV, RTX 5090 engine) (1) |
+| Decode path | MB96 / MB128 GEMM tiles with a measured split-K table, fused MLP and RMSNorm, head-packed drafter attention, MTP k = 7 with a dynamic depth schedule, DRAFT-DYN, int4 draft heads, DS-SUB | with the rest of the stack, on upstream's own benchmark: aggregate decode 125.0 vs 91.2 tok/s at 1 stream and 530.2 vs 365 at 16 (prose); 84.9 vs 66.1 and 532.7 vs 350 (code) (1) |
+| Prefill | GDN chunked-prefill port; int8 / int4 KV prefill attention on oneDNN SDPA or, for long prompts, chunked FA | with the rest of the stack: cold prefill 2,722 (2K), 3,153 (8K), 2,823 (32K) tok/s; upstream 2,421 (4K), 2,124 (32K) (1) |
+| K smoothing | stores K minus a per-channel mean in the quantized KV cache; enables the fused int4 KV write | public table vs production's traffic-built one: NLL +0.037 %; no table: NLL +0.43 %; table + fused write: 1-stream aggregate 111.8 -> 119.7 tok/s (2) |
+| LoRA decode kernels (`lorak/`) | LoRA terms inside the EXL3 small-M linear and the fused decode MLP | LoRA decode 179.9 tok/s (1 stream), 161.2 (2 streams) with AllBroker's lend manager (2) |
+| GDN recompute, fused NaN guard | MTP with one committed SSM state per request; fused kernel for the model runner's NaN guard | not published separately |
+
+Sources: (1) AllRunner [benchmarks/README.md](https://github.com/echowarp/AllRunner/blob/main/benchmarks/README.md);
+(2) [RELEASE-ARC.md](RELEASE-ARC.md). The upstream results further down were measured with upstream's fp8-KV
+configuration.
+
+## Which branch
+
+- `publish-20261113` (this branch): the Arc B70 production fork, on upstream commit 15ded2f.
+- `main` is upstream, unchanged.
+
+## How it fits
+
+The kernels here are the fast math only; what stays in GPU memory (weight keeper, lazy vision tower, KV lending,
+host-RAM KV tier) is [AllBroker](https://github.com/echowarp/AllBroker). Several switches need the companion vLLM
+branch, [echowarp/vllm](https://github.com/echowarp/vllm) `publish-20261113-xpu`; with stock vLLM they log and keep the
+stock path. [AllRunner](https://github.com/echowarp/AllRunner) builds the Arc image from these three repos, pinned by
+commit, and holds the launchers, router and benchmarks.
+
+## License
+
+MIT, as upstream ([LICENSE](LICENSE)). `gdnchunk/` is Apache-2.0 (its own `LICENSE` and `NOTICE`); other third-party
+code: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Upstream's README follows; this fork changed only a note on
+the configuration in its Results section and the serving-config line.
+
+---
+
+## Upstream README
+
+# exl3xpu
 
 ![Qwen3.8-27B EXL3 on one Intel Arc Pro B70](docs/banner/banner.png)
 
