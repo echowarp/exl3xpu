@@ -114,12 +114,28 @@ cells are not paired; only the 128k column produced the same text in every arm.
 - The benchmark text is copy-heavy and accepts far more than real traffic (8.6–8.8 tok/step at depth 10–12); even there
   deeper drafts only break even, at 128k (+1–2 %).
 
+**Where the step goes, and what the drafter costs** (2026-11-17/18, int4 KV, k = 7, production sampling, 8k and 64k
+context at 1 / 2 / 4 streams; device events without syncs in the timed runs, the profiler only in a separate window):
+- At 1 stream and 8k the verify forward (one XPU graph: GEMMs, GDN, attention) is 30.5 ms of a 39.2 ms step.
+- The drafter is 5.7 ms of GPU time per step at 8k (0.81 ms per pass; 0.95 ms at 64k): MTP-layer GEMV 2.6 ms, int4
+  draft heads 1.1, draft sampler 0.6. It issues ~360 kernel launches per step and takes ~23 ms of host enqueue
+  time, all of it hidden under the verify graph.
+- Exposed host time (the GPU idle, waiting for the host) is 0.4–0.8 ms per step, 0.7–2 % in every cell. A
+  device-resident spec step (draft, verify and bookkeeping as one graph) or fusing the drafter's launches is therefore
+  worth ≤ ~2 %. Not built.
+- Capturing draft passes 2..k as one XPU graph (`EXL3_DRAFT_GRAPH`) is neutral: ±0.4 % steps/s, paired greedy
+  outputs. It cuts the drafter's host time from 23 to 5–6.5 ms and the launches from 484 to 197 per step; the GPU side
+  is unchanged.
+- At 1 stream the host is nearly saturated (~38 ms of host work per 39 ms step), so a future GPU saving of more than
+  ~1 ms at 8k would be capped by the host unless the drafter graph is on. Pair the two.
+
 **Conclusion.** On the B70, k = 7 (8 verify rows) is the depth where one query head per thread, one DPAS row tile and
 one set of K/V messages all still fit. Past it, attention nearly doubles, and the extra drafter passes alone eat most
 of what positions 8–12 could add, so even a free 16-row attention would not make deeper drafts pay at long context.
 What would change it:
-- **cheaper drafting**: fewer launches per draft pass, or one drafter pass for all positions (parallel drafting, which
-  needs a retrained drafter), so that extra positions cost little;
+- **cheaper drafting**: less GPU work per draft pass (the MTP-layer GEMV is 2.6 of the drafter's 5.7 ms), or one
+  drafter pass for all positions (parallel drafting, which needs a retrained drafter), so that extra positions cost
+  little. Fewer launches would not help: they are already hidden under the verify graph (above);
 - **a GPU with more registers per thread**, so that one thread can keep 16 rows (16 KB of fp32 O alone) resident and
   the second set of K/V messages disappears.
 
@@ -175,7 +191,7 @@ larger share, also at long context.
 | each K/V message once per work-group | 0.613 (−31 %) | 0.361 (−21 %) | 2.29 (−25 %) |
 
 The last row is the bound for any "share once" design: −21..−31 % of verify attention at 100–196k, which is about
-+7–8 % steps/s at 190k, +4–5 % at 128k and ~+2 % at 64k. Not built (see "Open ideas").
++7–8 % steps/s at 190k, +4–5 % at 128k and ~+2 % at 64k. Not built (see [Open ideas](#open-ideas-not-built)).
 
 **K load layout re-check (int4, 196k, B=1 / B=4):** production (two 8-dword transposed loads every 4 chunks) 0.869 /
 3.006 ms; one 8-dword load per 2 chunks 0.948 / 3.036 (+9 / +1 %); one 16-dword line per 4 chunks, half the messages,
@@ -197,6 +213,25 @@ quality but gained only ~+0.3 % end to end (off by default, `EXL3_Q8_FOLD_MIN_M`
 **GEMM register double-buffering** (load the next weight words while decoding the current ones, 2026-09-30): 29.3 ms
 vs 28.1 ms at 6 rows; spills at 12 rows. No registers to spare at large tiles.
 
+**The trellis decode is integer-pipe bound** (2026-09-30). At 6 rows the decode GEMM's counters show occupancy 66 %,
+the integer ALU 41 % busy and XMX 7 % busy. With fake weights (no trellis decode, wrong output) the linears take 26.1
+instead of 28.1 ms per step, 502 GB/s. A codebook lookup table instead of the computed decode is 7.1 % slower end to
+end (gather-bound; 4.5x slower in a MoE GEMV lab kernel), and the MUL16 decode variant 11 % slower. Anything that adds
+ALU work to this GEMM loses (Hadamard fusion and double-buffering above).
+
+**Row-count cliffs in the trellis GEMM.** All-linears time per decode step (graph replay): 8 rows 27.9 ms, 16 rows 30.6
+(+9.8 %), 17 rows 34.6 (+13 % over 16 and +24 % over 8: a new DPAS row tile), 32 → 36 rows 37.4 → 45.2 ms (+21 %)
+(2026-10-22, 11-09). A 128-GRF MB40 tile recovers ~3 % at 33–40 rows (shipped); retuning split-K added nothing, and
+most of the step just past 32 rows is unexplained. Hybrid fp16 accumulation, faster on an older kernel build, is
+2.0–2.6 % slower at the row counts production runs (17–24) and changes numerics. The depth tables keep
+streams x (k + 1) ≤ 32 where they can.
+
+**Explicit prefetch costs on Xe2 instead of hiding latency.** L1 `lsc_prefetch_2d` in the trellis GEMM: 2.7 / 5 / 16 %
+slower at distance 2 / 4 / 8 (2026-09-30); in the int8 decode attention 2x slower (2026-10-13); in verify attention see
+the int8 table in [Long-context verify attention](#long-context-verify-attention). L2 prefetch (MoE GEMV lab,
+2026-10-20): kernels run one at a time and a kernel can't retire until its prefetches drain, so a prefetch costs its
+full DRAM time wherever it is issued (~5 us for 3 MB) and saved less than that.
+
 **Activation sparsity (TEAL / CATS style).** Not applicable to EXL3: the Hadamard rotations (incoherence processing)
 make every linear's input dense and Gaussian-like in the stored basis. Zeroing the smallest 40 % of such a vector
 drops ~3.6 % of its energy, ~19 % relative output error per layer. It would need an unrotated weight format and new
@@ -206,7 +241,25 @@ kernels.
 output unchanged). On the synthetic benchmark an 8k window gave +4 % at 96–128k and +11 % at 190k (2026-11-01). On
 a 200k-token retrieval suite on the Arc it lost about a third of the accepted tokens: 6.07 tok/step dense vs 4.08 with
 the 8k window (2026-11-16); the same window on the RTX 5090 port lost 20 % per-request decode on real traffic at
-24–52k. The drafter needs the far context. Keep it unset.
+24–52k. The drafter needs the far context. Keep it unset. *Method lesson:* the synthetic text is copy-heavy, so it
+rewarded a window that real long-context traffic punishes. Decide on real traffic.
+
+**Draft vocabulary granularity.** The drafter scores a pruned output head (only the token blocks the traffic needs).
+EXL3 applies the output Hadamard per 128 columns, so a pruned head must keep whole 128-token blocks; frequency-packed
+16-token blocks give an invalid head (1.3 tok/step, measured on the CUDA port, 2026-10-14). A full-vocabulary draft
+head is 6.4 % slower despite higher acceptance (53 vs 48 %): reading the full head on every draft pass costs more than
+the extra tokens gain (2026-09-28).
+
+**Greedy or sharpened drafting** (2026-09-30, 10-23). Greedy drafting never accepts more than probabilistic drafting,
+at any position, nor at any draft confidence below 0.9 (equal only above it). Acceptance at positions 1–6:
+probabilistic 0.824 / 0.756 / 0.692 / 0.660 / 0.633 / 0.607, greedy 0.764 / 0.712 / 0.653 / 0.624 / 0.601 / 0.571;
+greedy engine arms −6..−10 %. Sharpening the draft distribution lowers acceptance too: draft top-k / top-p filtering
+52.0 vs 57.9 %, temperature x0.8 54.5 %, x1.3 47.8 %. The draft's own T = 1 distribution is best.
+
+**Tree drafting** (a second candidate token at the first rejected depth, 2026-10-20). A second candidate is accepted in
+25–26 % of rejected steps (+6.3–6.9 % tok/step if a sibling sat at every depth), but each sibling costs a verify row
+every step (7 → 13 rows ≈ +7 % step) and 3+ streams cross the 16-row tile. Gating by draft confidence did not separate
+good rows. Net ≈ +2 % at 1 stream; shelved.
 
 **VARR without the length gate** (4-tile V loads in the int8 verify kernel for ≥ 2 sequences at any length): −10..−12 %
 verify attention at B ≥ 2 on long int8 contexts, soak-tested clean. Moot on int4 KV: the int4 kernel's V load already
@@ -220,18 +273,49 @@ token-head KV.
 per 32-key block vs ~190 in the cutlass fp16 kernel; 0.55–0.6x cutlass, and a variant with fp16 P·V still 0.38x
 production. Production prefill attention uses oneDNN SDPA instead.
 
-**Tree drafting** (a second candidate token at the first rejected depth, 2026-10-20). A second candidate is accepted in
-25–26 % of rejected steps (+6.3–6.9 % tok/step if a sibling sat at every depth), but each sibling costs a verify row
-every step (7 → 13 rows ≈ +7 % step) and 3+ streams cross the 16-row tile. Gating by draft confidence did not separate
-good rows. Net ≈ +2 % at 1 stream; shelved.
+**oneDNN attention on BMG** (2026-10-21, 11-08). oneDNN SDPA with a softmax-statistics (LSE) output, which merging
+attention over key slices needs, leaves the fused micro_sdpa kernel for a reference path that asks for 78–146 GiB.
+And oneDNN prefill attention over the int8 cache dequantizes the whole history to fp16 per layer (~0.6 GB at 130k),
+which ran a 262k-context engine out of memory at ~122k. *Shipped instead:* above `EXL3_I8_ONEDNN_MAXLEN` keys, chunked
+FA2 with a running LSE merge.
+
+**XPU graph memory** (2026-10-19 .. 11-07). Each XPU graph takes ~8.9 MiB of device memory outside the torch pool
+(~80 graph segments, ~710 MiB per piecewise capture size), and vLLM's KV sizing doesn't budget for it: capture with
+FULL_AND_PIECEWISE failed with `UR_RESULT_ERROR_OUT_OF_RESOURCES` after 1 of 8 sizes. Where piecewise graphs fit,
+decode lost: piecewise graphs for the drafter −22 % at 1 stream (piecewise replay splits at every attention op), and
+with piecewise mixed steps (137.5 → 115.0 ms) decode steps went from 40.1 to 81.0 ms. The compute-runtime knob that
+halves graph memory (`OverrideCmdListCmdBufferSizeInKb=64`, 8.9 → 4.2 MiB per graph) makes FULL-graph decode 10 %
+slower. Production captures full graphs for decode steps only.
+
+**vLLM traces Python shape branches once.** vLLM compiles one dynamic-shape graph at a large token count, so a Python
+branch on the batch size inside a forward is frozen at trace time. Fused decode kernels silently never ran under
+graphs / torch.compile until each was moved behind an opaque custom op that dispatches at run time (on a 35B-A3B MoE
+model: 113.0 → 142.9 tok/s at 1 stream). LoRA adapters were silently not applied in compiled mode for the same
+reason: the XPU punica wrapper decides in Python whether an adapter is active, and the startup trace had none
+(first-token logprobs equal to the base model; `--enforce-eager` applied them).
+
+**Nondeterminism sources on XPU** (2026-10-14 .. 10-17). Cold runs on identical input differed in the KV cache. The two
+sources: vLLM's XPU `gdn_attention` op (2 of 5 repeats bit-equal at 4,096 tokens) and torch-XPU fp16 GEMM (oneDNN) at
+N = 96 for some row counts (0 of 5 repeats bit-equal at M = 2,352 / 2,355; the large fp16 GEMMs were bit-identical).
+Torch's global deterministic mode can't be used: Inductor refuses its autotuning benchmarks and the engine doesn't
+start. Fixed with our own GDN port (`EXL3_GDN_PORT`) plus a linear op that turns deterministic mode on only around its
+GEMM (`EXL3_DET_LINEAR`): short / 6k / 16k cold runs bit-identical, every KV block equal.
 
 **Two engines on one Arc** (render and compute engine queues, weights shared, 2026-10-31). Real concurrency, but the
 render queue has hardware priority: the compute queue gets about 25 % while the other is busy, and no software knob
 changed that. It is a priority choice (decode 67 % / prefill 25 %, or decode 14 % / prefill 88 %), not more capacity,
-at about 6 GB of host RAM per extra engine and a split KV cache.
+at about 6 GB of host RAM per extra engine and a split KV cache. Compute work has one compute engine: two queues or two
+contexts on it run strictly serial (an int8 weight reconstruct and a GEMM on two queues took exactly the sum of their
+times, 2026-10-20), and two SYCL queues in one process made a decode step wait for all queued prefill (612 ms).
 
-**Driver / runtime knobs** (2026-10-20): the compute runtime's graph-memory knob −10 % graph decode; Unified Runtime v1
-batched command lists −3 % decode.
+**Unified Runtime v1 batched command lists** (2026-10-20): −16–20 % host time per launch in a microbenchmark, but
+engine decode −3 %.
+
+**Level Zero userptr import of a shared-memory pool** (2026-10-13/14). Importing the host RAM KV tier's shared-memory
+pool into Level Zero as a userptr made stores faster (6.1 → 9.1 GiB/s), but caused copy-engine "Engine memory CAT"
+faults, copy-engine resets and engine hangs: the pool was not mlocked, so its pages could be swapped or migrated under
+the copy engine, which doesn't recover. A single 24 GiB import also fails with `OUT_OF_HOST_MEMORY` (not a memlock
+limit). Mlock the pool or don't import it; the import is off by default.
 
 **llama.cpp Vulkan** (2026-09-29): 18.4 t/s decode and 350 t/s prefill on this model, vs ~85 / ~2,600 for this stack at
 the time. The custom ESIMD kernels already run the int8 GEMM near hardware peak, so a different API cannot win much.
@@ -239,14 +323,29 @@ the time. The custom ESIMD kernels already run the int8 GEMM near hardware peak,
 **AOT compilation** (`spir64_gen`, BMG-G31, large GRF, 2026-09-29): IGC crashed on 24 kernels. The libraries ship as
 JIT builds.
 
+**Power and clocks: a warning.** At stock the card sits at its 275 W limit with PL2 throttling for the whole decode
+(2,600–2,650 of 2,800 MHz). pcode clamps the cap at 275 W even when the sysfs cap reads higher; raising it needs the
+overclocking mailbox. Measured gain, 330 vs 300 W (2026-10-20): +3..+7 % prefill, +2.8 % decode at 1 stream, +1.9 % at
+4 streams. Don't change the GDDR data rate under Linux: a live write of OC domain 0x17 hung the GT within 0.6 s and
+needed a power cycle (2026-09-29), and setting it at driver probe failed the same way.
+
+**Idle power** (2026-10-30). `pcie_aspm.policy=powersupersave` left the B70 stuck in D3cold at boot (xe probe −71). A
+telemetry poller (1 Hz `xpu-smi dump` plus fdinfo reads) kept the GT out of RC6 entirely: 0.0 % RC6 and 57 W at idle,
+vs ~46 W without it.
+
+**Tooling on xe.** `intel_gpu_top` doesn't work with the xe driver; `xpu-smi` reports memory GB/s as N/A and
+utilization stuck at 22.22. The torch profiler doesn't see kernels inside XPU graph replays, and its device times
+disagree with graph replay (one paired kernel change: −1.5 us per layer in the profiler, +2.6 us in graph replay, and
+the engine followed graph replay). Use fdinfo engine-busy counters, derive bandwidth from bytes moved per step, and
+trust paired wall-clock A/Bs.
+
 ## Open ideas, not built
 
 - **Share-once K/V through SLM as raw int4 bytes.** Split the 6 head threads of a work-group into 2 groups of 3 that
   each issue half of the K/V messages and pass the other half through SLM as packed int4 (1 KB per 32-key block per
   KV head, half the bytes of the int8 SLM probe that lost 3x). Gate first with a read-side SLM probe on int4 bytes; build
   only if it costs < ~25 % of the 2D loads it replaces. Bound: ≤ +8 % steps/s at 190k, ≤ +2 % at 64k.
-- **A lower-launch drafter.** The drafter is host-bound: with profiler syncs, the GPU was busy 6.0 ms of a 17.6 ms
-  draft wall at k = 7, ~390 kernels per step (reported 2026-11-14). That figure needs re-measuring without syncs
-  before any work; the plan is to capture the draft passes, verify and acceptance bookkeeping as one device-resident
-  graph if the exposed host time is ≥ ~20 % of the step. This is also the lever that would make deeper drafts worth
-  revisiting.
+
+A lower-launch drafter is not on this list: measured on 2026-11-18, the drafter's launches are hidden under the
+verify graph and the whole exposed host time is ≤ ~2 % of a step (see
+[MTP width and draft depth](#mtp-width-and-draft-depth-why-verify-stops-at-8-rows-k--7)).
