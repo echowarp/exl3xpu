@@ -21,6 +21,9 @@ Some features need companion patches to vLLM itself (the vLLM 0.26 XPU branch th
 "vLLM patch" below). The plugin imports nothing from the KV-tier client packages (`llmt_kv`, `llmt_kvbroker_arc`): the
 production engine loads those only through vLLM's `kv_transfer_config` (OffloadingConnector + a broker spec).
 
+What did not work on the Arc (kernel layouts, deeper MTP drafts, Hadamard fusion, drafter window and more, with the
+measured numbers and the hardware reason for each): [docs/arc-dead-ends.md](docs/arc-dead-ends.md).
+
 ## Building
 
     scripts/build_arc.sh            # all libraries into exl3xpu/

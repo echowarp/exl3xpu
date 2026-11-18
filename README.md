@@ -21,6 +21,9 @@ Sources: (1) AllRunner [benchmarks/README.md](https://github.com/echowarp/AllRun
 (2) [RELEASE-ARC.md](RELEASE-ARC.md). The upstream results further down were measured with upstream's fp8-KV
 configuration.
 
+What we measured on the Arc and dropped (with numbers and the Xe2 reason, including why MTP verify stops at 8 rows):
+[docs/arc-dead-ends.md](docs/arc-dead-ends.md).
+
 ## Which branch
 
 - `publish-20261113` (this branch): the Arc B70 production fork, on upstream commit 15ded2f.
