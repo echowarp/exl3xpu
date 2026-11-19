@@ -27,6 +27,16 @@ and the data files: [README-ARC.md](README-ARC.md). Release notes: [RELEASE-ARC.
 Sources: (1) AllRunner [benchmarks/README.md](https://github.com/echowarp/AllRunner/blob/main/benchmarks/README.md);
 (2) [RELEASE-ARC.md](RELEASE-ARC.md). For scale, llama.cpp SYCL Q4_K_M on the same card: 20-37 tok/s single stream (1).
 
+Cold prefill of a 32k-token prompt (upstream's `sweep.py` prefill phase, production launcher, mean of 3 reps; others as
+published):
+
+![Arc Pro B70, prefill a 32k-token prompt](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/arc-prefill.png)
+
+Quality with int4 KV and EXL3 4.0 bpw: 5-task mean on the published rows' harness, KL vs BF16, and GPQA Diamond /
+IFBench with thinking on (Arc B70 and RTX 5090 runs pooled):
+
+![Q4_K_M-level quality](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/quality.png)
+
 What we measured on the Arc and dropped (kernel layouts, deeper MTP drafts, Hadamard fusion, drafter window and more,
 with the numbers and the Xe2 reason, including why MTP verify stops at 8 rows): [docs/arc-dead-ends.md](docs/arc-dead-ends.md).
 
